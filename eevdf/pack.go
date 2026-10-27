@@ -7,6 +7,7 @@ type Pack struct {
 	remainder uint64
 	emptyGen  uint64
 	members   map[int32]*Task
+	core      struct{ origin, gen uint64 }
 }
 
 func (pk *Pack) join(t *Task) {

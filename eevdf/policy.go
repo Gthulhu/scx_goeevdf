@@ -17,6 +17,7 @@ const (
 const (
 	CmdDispatch uint32 = 1
 	CmdKick     uint32 = 2
+	CmdStop     uint32 = 3
 	SchedBatch  uint32 = 3
 	SchedIdle   uint32 = 5
 )
@@ -70,6 +71,13 @@ type Policy struct {
 	seq           uint64
 	groups        map[uint64]*Group
 	bandwidth     []*bwGroup
+	topo          Topology
+	ld            *Load
+	nb            *Newidle
+	bal           *Balance
+	act           *Active
+	now           uint64
+	lastStop      map[*Task]uint64
 }
 
 func New(io IO, cpus int, enums Enums) *Policy {
@@ -78,7 +86,12 @@ func New(io IO, cpus int, enums Enums) *Policy {
 		packs: make([]*Pack, cpus), trees: make([]Tree, cpus),
 		cpus: make([]cpuState, cpus), tasks: make(map[int32]*Task),
 		groups: make(map[uint64]*Group),
+		topo: defaultTopology(cpus), lastStop: make(map[*Task]uint64),
 	}
+	p.ld = &Load{p: p, cpus: make([]cpuLoad, cpus), tasks: make(map[*Task]*taskLoadState)}
+	p.nb = newNewidle(p)
+	p.bal = &Balance{p: p, cpus: make([]balCPU, cpus)}
+	p.act = &Active{p: p, cpus: make([]actCPU, cpus), migrate: make(map[*Task]int32)}
 	for c := range p.packs {
 		p.packs[c] = &Pack{CPU: int32(c)}
 		p.syncQueued(int32(c))
@@ -90,6 +103,12 @@ func (p *Policy) valid(cpu int32) bool { return cpu >= 0 && int(cpu) < len(p.cpu
 
 func (p *Policy) syncQueued(c int32) {
 	n := uint64(p.trees[c].Len())
+	if p.nb != nil {
+		st := &p.nb.cpus[c]
+		if !st.queued && n != 0 { p.nb.overloaded++ }
+		if st.queued && n == 0 { p.nb.overloaded-- }
+		st.queued = n != 0
+	}
 	// A quota-limited current task must return to Go at the end of its
 	// dispatched slice, even if the EDQ is empty. Otherwise the BPF keep
 	// shortcut could run it indefinitely without charging cpu.max.
@@ -145,6 +164,7 @@ func (p *Policy) prepare(t *Task) {
 }
 
 func (p *Policy) Handle(e Event) {
+	if e.Now != 0 { p.now = e.Now }
 	switch e.Kind {
 	case EvEnqueue:
 		p.enqueue(e)
@@ -163,6 +183,8 @@ func (p *Policy) Handle(e Event) {
 		}
 	case EvIdle:
 		if p.valid(e.Cpu) {
+			p.nb.cpus[e.Cpu].idleStamp = p.now
+			p.ld.cpus[e.Cpu].idleStamp = p.now
 			p.handoff = append(p.handoff, e.Cpu)
 		}
 	}
@@ -219,6 +241,11 @@ func (p *Policy) enqueue(e Event) {
 	p.removeQueued(t)
 	p.removeBacklog(t)
 	p.charge(t, e.SumExec)
+	if p.cpus[t.Cpu].task == t {
+		p.ld.taskQuiesce(t, false, p.now)
+		p.ld.cpuRunning(t.Cpu, false, p.now)
+		p.lastStop[t] = p.now
+	}
 	t.state = Sleeping
 	t.EnqSeq, t.Policy, t.CustomSlice = e.EnqSeq, e.Policy, e.CustomSlice
 	p.refreshAllowed(t)
@@ -237,7 +264,13 @@ func (p *Policy) enqueue(e Event) {
 	if wake && t.pack != nil {
 		t.pack.quiesce(t, true, max(p.request(t), p.Slice)+p.TickNs)
 	}
+	if wake { p.ld.taskWoke(t, p.now) }
 	dst := p.selectCPU(t, e, wake)
+	if !wake {
+		if reserved, ok := p.act.handedOver(t, p.now); ok && p.allowed(t, reserved) {
+			dst = reserved
+		}
+	}
 	p.packs[dst].place(t, wake || t.initial)
 	if from != dst && p.valid(from) {
 		p.recomputeWeights(from)
@@ -311,6 +344,9 @@ func (p *Policy) dispatch(t *Task, cpu int32, preempt bool) {
 	p.cpus[cpu].task = t
 	p.cpus[cpu].protect = t.Req.Deadline
 	p.cpus[cpu].runSeq = before
+	p.nb.idleEnded(cpu, p.now)
+	p.ld.taskRunning(t, true, p.now)
+	p.ld.cpuRunning(cpu, true, p.now)
 	p.syncQueued(cpu)
 }
 
@@ -346,6 +382,11 @@ func (p *Policy) leave(e Event) {
 	p.removeQueued(t)
 	p.removeBacklog(t)
 	p.charge(t, e.SumExec)
+	if p.valid(t.Cpu) && p.cpus[t.Cpu].task == t {
+		p.ld.cpuRunning(t.Cpu, false, p.now)
+	}
+	p.ld.taskQuiesce(t, e.Kind == EvSleep, p.now)
+	p.lastStop[t] = p.now
 	if t.pack != nil {
 		t.pack.quiesce(t, e.Kind == EvSleep, max(p.request(t), p.Slice)+p.TickNs)
 		p.recomputeWeights(t.Cpu)
@@ -360,6 +401,12 @@ func (p *Policy) leave(e Event) {
 	}
 	t.state = Sleeping
 	if e.Kind == EvExit {
+		if dst, ok := p.act.migrate[t]; ok {
+			delete(p.act.migrate, t)
+			p.act.cpus[dst].reserved = false
+		}
+		delete(p.ld.tasks, t)
+		delete(p.lastStop, t)
 		delete(p.tasks, t.Pid)
 	}
 }
@@ -420,6 +467,9 @@ func (p *Policy) ReconcileDropped() {
 			p.recomputeWeights(cpu)
 		}
 		t.Req.Sleep()
+		p.ld.taskQuiesce(t, true, p.now)
+		p.ld.cpuRunning(cpu, false, p.now)
+		p.lastStop[t] = p.now
 		t.state = Sleeping
 		p.cpus[c].task = nil
 		p.syncQueued(cpu)

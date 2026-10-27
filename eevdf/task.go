@@ -13,6 +13,7 @@ type Task struct {
 	Allowed     []int32
 	Vruntime    uint64
 	Req         Request
+	Slot        uint32
 
 	seq     uint64
 	node    *node

@@ -124,6 +124,9 @@ func run(ctx context.Context, object string) error {
 	p := eevdf.New(backend{sched: s, pressure: pressure}, ncpu, eevdf.Enums{
 		EnqWakeup: 1, EnqPreempt: 1 << 32,
 	})
+	if err := p.SetTopology(readTopology("/sys/devices/system/cpu", ncpu)); err != nil {
+		return fmt.Errorf("CPU topology: %w", err)
+	}
 	var groups groupSync
 	samples := make([]eevdf.StatSample, ncpu)
 	if err := s.Attach(); err != nil {
