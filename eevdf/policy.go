@@ -46,7 +46,7 @@ type IO interface {
 }
 
 type Enums struct {
-	EnqWakeup, EnqPreempt uint64
+	EnqWakeup, EnqPreempt, EnqBlocked uint64
 }
 
 type cpuState struct {
@@ -62,6 +62,7 @@ type runSeqIO interface {
 type Policy struct {
 	Slice, TickNs uint64
 	Enum          Enums
+	F             Features
 	io            IO
 	packs         []*Pack
 	trees         []Tree
@@ -71,11 +72,14 @@ type Policy struct {
 	seq           uint64
 	groups        map[uint64]*Group
 	bandwidth     []*bwGroup
+	sharedQuota   *SharedQuotaPool
 	topo          Topology
 	ld            *Load
 	nb            *Newidle
 	bal           *Balance
 	act           *Active
+	hr            *Hrtick
+	pub           *CorePublisher
 	now           uint64
 	lastStop      map[*Task]uint64
 }
@@ -83,15 +87,18 @@ type Policy struct {
 func New(io IO, cpus int, enums Enums) *Policy {
 	p := &Policy{
 		Slice: BaseSlice(cpus), TickNs: 1_000_000, Enum: enums, io: io,
+		F:     DefaultFeatures(),
 		packs: make([]*Pack, cpus), trees: make([]Tree, cpus),
 		cpus: make([]cpuState, cpus), tasks: make(map[int32]*Task),
 		groups: make(map[uint64]*Group),
-		topo: defaultTopology(cpus), lastStop: make(map[*Task]uint64),
+		topo:   defaultTopology(cpus), lastStop: make(map[*Task]uint64),
 	}
 	p.ld = &Load{p: p, cpus: make([]cpuLoad, cpus), tasks: make(map[*Task]*taskLoadState)}
 	p.nb = newNewidle(p)
 	p.bal = &Balance{p: p, cpus: make([]balCPU, cpus)}
 	p.act = &Active{p: p, cpus: make([]actCPU, cpus), migrate: make(map[*Task]int32)}
+	p.hr = NewHrtick(p)
+	p.pub = NewCorePublisher(MaxTaskSlots)
 	for c := range p.packs {
 		p.packs[c] = &Pack{CPU: int32(c)}
 		p.syncQueued(int32(c))
@@ -105,14 +112,18 @@ func (p *Policy) syncQueued(c int32) {
 	n := uint64(p.trees[c].Len())
 	if p.nb != nil {
 		st := &p.nb.cpus[c]
-		if !st.queued && n != 0 { p.nb.overloaded++ }
-		if st.queued && n == 0 { p.nb.overloaded-- }
+		if !st.queued && n != 0 {
+			p.nb.overloaded++
+		}
+		if st.queued && n == 0 {
+			p.nb.overloaded--
+		}
 		st.queued = n != 0
 	}
 	// A quota-limited current task must return to Go at the end of its
 	// dispatched slice, even if the EDQ is empty. Otherwise the BPF keep
 	// shortcut could run it indefinitely without charging cpu.max.
-	if t := p.cpus[c].task; t != nil {
+	if t := p.cpus[c].task; t != nil && n == 0 && p.F.CpuMax {
 		for g := p.group(t); g != nil; g = g.Parent {
 			if g.bw != nil {
 				n++
@@ -164,7 +175,14 @@ func (p *Policy) prepare(t *Task) {
 }
 
 func (p *Policy) Handle(e Event) {
-	if e.Now != 0 { p.now = e.Now }
+	if e.Now != 0 {
+		p.now = e.Now
+	}
+	defer func() {
+		if t := p.tasks[e.Pid]; t != nil {
+			p.pub.PublishTask(p, t, p.now)
+		}
+	}()
 	switch e.Kind {
 	case EvEnqueue:
 		p.enqueue(e)
@@ -217,7 +235,7 @@ func (p *Policy) cpumask(t *Task) {
 	from := t.Cpu
 	p.removeQueued(t)
 	t.state = Sleeping
-	p.packs[dst].place(t, false)
+	p.placeTask(t, dst, false)
 	t.Cpu = dst
 	p.recomputeWeights(from)
 	p.recomputeWeights(dst)
@@ -237,6 +255,7 @@ func (p *Policy) enqueue(e Event) {
 	if t == nil {
 		t = &Task{Pid: e.Pid, Tgid: e.Tgid, Cpu: e.Cpu, initial: true}
 		p.tasks[e.Pid] = t
+		p.pub.Allocate(t)
 	}
 	p.removeQueued(t)
 	p.removeBacklog(t)
@@ -248,6 +267,7 @@ func (p *Policy) enqueue(e Event) {
 	}
 	t.state = Sleeping
 	t.EnqSeq, t.Policy, t.CustomSlice = e.EnqSeq, e.Policy, e.CustomSlice
+	t.Blocked = p.F.ProxyExec && p.Enum.EnqBlocked != 0 && e.Flags&p.Enum.EnqBlocked != 0
 	p.refreshAllowed(t)
 	nice := LoadWeight(e.Weight)
 	if t.Weight == 0 {
@@ -261,22 +281,29 @@ func (p *Policy) enqueue(e Event) {
 		p.cpus[from].task = nil
 		p.syncQueued(from)
 	}
-	if wake && t.pack != nil {
-		t.pack.quiesce(t, true, max(p.request(t), p.Slice)+p.TickNs)
+	if wake && t.pack != nil && !t.Blocked {
+		t.pack.quiesceWith(t, true, max(p.request(t), p.Slice)+p.TickNs, p.F.DelayDequeue)
 	}
-	if wake { p.ld.taskWoke(t, p.now) }
+	if wake {
+		p.ld.taskWoke(t, p.now)
+	}
 	dst := p.selectCPU(t, e, wake)
-	if !wake {
+	if !wake && !t.Blocked {
 		if reserved, ok := p.act.handedOver(t, p.now); ok && p.allowed(t, reserved) {
 			dst = reserved
 		}
 	}
-	p.packs[dst].place(t, wake || t.initial)
+	p.placeTask(t, dst, (wake && !t.Blocked) || t.initial)
 	if from != dst && p.valid(from) {
 		p.recomputeWeights(from)
 	}
 	p.recomputeWeights(dst)
-	p.prepare(t)
+	if !p.F.PlaceRelDeadline && !t.Blocked {
+		t.Req.Sleep()
+	}
+	if !t.Blocked || t.Req.Slice == 0 {
+		p.prepare(t)
+	}
 	if p.throttled(t) {
 		p.park(t)
 		if wasCurr {
@@ -284,7 +311,7 @@ func (p *Policy) enqueue(e Event) {
 		}
 		return
 	}
-	if wasCurr && !wake && from == dst && p.keepRunning(t, from) {
+	if wasCurr && !wake && !t.Blocked && from == dst && p.keepRunning(t, from) {
 		p.dispatch(t, from, false)
 		return
 	}
@@ -300,10 +327,13 @@ func (p *Policy) queue(t *Task, cpu int32, wake bool) {
 	t.seq = p.seq
 	p.trees[cpu].Insert(t)
 	p.syncQueued(cpu)
-	if p.cpus[cpu].task == nil && p.trees[cpu].Len() == 1 && p.io.Idle(cpu) {
+	if !t.Blocked && p.cpus[cpu].task == nil && p.trees[cpu].Len() == 1 && p.io.Idle(cpu) {
 		p.dispatch(t, cpu, false)
-	} else if wake && p.shouldPreempt(t, cpu) {
+	} else if wake && p.shouldPreemptWith(t, cpu, p.F) {
 		p.dispatch(t, cpu, true)
+	}
+	if p.F.Hrtick {
+		p.hr.joinedLone(cpu, p.now)
 	}
 }
 
@@ -321,8 +351,9 @@ func (p *Policy) dispatch(t *Task, cpu int32, preempt bool) {
 		return
 	}
 	p.removeQueued(t)
-	cmd := Cmd{Kind: CmdDispatch, Pid: t.Pid, Cpu: cpu, EnqSeq: t.EnqSeq, Slice: p.sliceFor(t)}
-	cmd.Slice = p.capSlice(t, cmd.Slice)
+	cmd := Cmd{Kind: CmdDispatch, Pid: t.Pid, Cpu: cpu, Slot: t.Slot,
+		EnqSeq: t.EnqSeq, Slice: p.sliceFor(t)}
+	cmd.Slice = p.reserveSlice(t, cmd.Slice)
 	if cmd.Slice == 0 {
 		p.park(t)
 		return
@@ -331,15 +362,19 @@ func (p *Policy) dispatch(t *Task, cpu int32, preempt bool) {
 		cmd.EnqFlags = p.Enum.EnqPreempt
 		cmd.ExpectCurr = p.io.CurrPid(cpu)
 	}
+	if p.F.Hrtick {
+		cmd.Cflags |= p.hr.dispatchFlag(cpu)
+	}
 	var before uint64
 	if r, ok := p.io.(runSeqIO); ok {
 		before = r.RunSeq(cpu)
 	}
+	p.pub.PublishTask(p, t, p.now)
 	if err := p.io.Submit(cmd); err != nil {
+		p.refundSlice(t, cmd.Slice)
 		p.queueRetry(t, cpu)
 		return
 	}
-	p.reserve(t, cmd.Slice)
 	t.Cpu, t.state = cpu, Dispatched
 	p.cpus[cpu].task = t
 	p.cpus[cpu].protect = t.Req.Deadline
@@ -348,6 +383,8 @@ func (p *Policy) dispatch(t *Task, cpu int32, preempt bool) {
 	p.ld.taskRunning(t, true, p.now)
 	p.ld.cpuRunning(cpu, true, p.now)
 	p.syncQueued(cpu)
+	p.hr.dispatched(cpu, p.now, cmd.Slice, cmd.Cflags)
+	p.pub.PublishTask(p, t, p.now)
 }
 
 func (p *Policy) queueRetry(t *Task, cpu int32) {
@@ -356,21 +393,24 @@ func (p *Policy) queueRetry(t *Task, cpu int32) {
 	t.seq = p.seq
 	p.trees[cpu].Insert(t)
 	p.syncQueued(cpu)
+	p.pub.PublishTask(p, t, p.now)
 }
 
 func (p *Policy) pick(cpu int32) *Task {
 	pk := p.packs[cpu]
-	if t := p.trees[cpu].PickEligible(pk.Ref); t != nil {
-		return t
+	if p.F.Eligibility && p.F.EligibleScan {
+		if t := p.trees[cpu].PickEligible(pk.Ref); t != nil {
+			return t
+		}
 	}
 	return p.trees[cpu].Min()
 }
 
 func (p *Policy) keepRunning(t *Task, cpu int32) bool {
-	if TimeBefore(p.packs[cpu].Ref, t.Vruntime) {
+	if p.F.Eligibility && TimeBefore(p.packs[cpu].Ref, t.Vruntime) {
 		return false
 	}
-	head := p.trees[cpu].PickEligible(p.packs[cpu].Ref)
+	head := p.pick(cpu)
 	return head == nil || !TimeBefore(head.Req.Deadline, t.Req.Deadline)
 }
 
@@ -388,7 +428,7 @@ func (p *Policy) leave(e Event) {
 	p.ld.taskQuiesce(t, e.Kind == EvSleep, p.now)
 	p.lastStop[t] = p.now
 	if t.pack != nil {
-		t.pack.quiesce(t, e.Kind == EvSleep, max(p.request(t), p.Slice)+p.TickNs)
+		t.pack.quiesceWith(t, e.Kind == EvSleep, max(p.request(t), p.Slice)+p.TickNs, p.F.DelayDequeue)
 		p.recomputeWeights(t.Cpu)
 	}
 	if e.Kind == EvSleep {
@@ -401,6 +441,7 @@ func (p *Policy) leave(e Event) {
 	}
 	t.state = Sleeping
 	if e.Kind == EvExit {
+		p.pub.Release(p, t)
 		if dst, ok := p.act.migrate[t]; ok {
 			delete(p.act.migrate, t)
 			p.act.cpus[dst].reserved = false
@@ -417,7 +458,8 @@ func (p *Policy) yield(e Event) {
 		return
 	}
 	p.charge(t, e.SumExec)
-	if TimeBefore(t.pack.Ref, t.Vruntime) || !TimeBefore(t.Vruntime, t.Req.Deadline) {
+	if (p.F.Eligibility && TimeBefore(t.pack.Ref, t.Vruntime)) ||
+		!TimeBefore(t.Vruntime, t.Req.Deadline) {
 		return
 	}
 	d := t.Req.Deadline - t.Vruntime
@@ -463,7 +505,7 @@ func (p *Policy) ReconcileDropped() {
 			continue
 		}
 		if t.pack != nil {
-			t.pack.quiesce(t, true, max(p.request(t), p.Slice)+p.TickNs)
+			t.pack.quiesceWith(t, true, max(p.request(t), p.Slice)+p.TickNs, p.F.DelayDequeue)
 			p.recomputeWeights(cpu)
 		}
 		t.Req.Sleep()
@@ -474,5 +516,6 @@ func (p *Policy) ReconcileDropped() {
 		p.cpus[c].task = nil
 		p.syncQueued(cpu)
 		p.handoff = append(p.handoff, cpu)
+		p.pub.PublishTask(p, t, p.now)
 	}
 }

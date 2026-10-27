@@ -45,6 +45,22 @@ func (b backend) RunSeq(cpu int32) uint64 {
 	return atomic.LoadUint64(&b.sched.CPU[cpu].RunSeq)
 }
 
+func (b backend) RunStart(cpu int32) uint64 {
+	return atomic.LoadUint64(&b.sched.CPU[cpu].RunStart)
+}
+
+func (b backend) Publish(slot uint32, value eevdf.TaskPub) {
+	b.sched.Publish(slot, bpf.TaskPub{
+		Pid: value.Pid, CoreVtime: value.CoreVtime,
+		Vruntime: value.Vruntime, Deadline: value.Deadline,
+		Lag: value.Lag, Weight: value.Weight,
+	})
+}
+
+func (b backend) SetPerf(cpu int32, perf uint64) {
+	b.sched.SetPerf(cpu, perf)
+}
+
 func (b backend) Available(cpu int32) uint64 {
 	return b.pressure.Available(cpu)
 }
@@ -102,7 +118,22 @@ func clockNow() uint64 {
 	return uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
 }
 
-func run(ctx context.Context, object string) error {
+type perfIO interface{ SetPerf(cpu int32, perf uint64) }
+
+func updateFrequency(p *eevdf.Policy, gov *eevdf.FrequencyGovernor, io perfIO, now uint64, cpus int, attached map[int32]bool) {
+	if !p.F.Cpufreq {
+		return
+	}
+	for c := 0; c < cpus; c++ {
+		cpu := int32(c)
+		util, capacity, runnable := p.FrequencySample(cpu, now)
+		if target, changed := gov.Update(cpu, now, util, capacity, runnable, attached[cpu]); changed {
+			io.SetPerf(cpu, target)
+		}
+	}
+}
+
+func run(ctx context.Context, object string, features eevdf.Features) error {
 	ncpu, err := possibleCPUs()
 	if err != nil {
 		return err
@@ -121,14 +152,18 @@ func run(ctx context.Context, object string) error {
 		return err
 	}
 	pressure := eevdf.NewPressure(ncpu)
-	p := eevdf.New(backend{sched: s, pressure: pressure}, ncpu, eevdf.Enums{
+	io := backend{sched: s, pressure: pressure}
+	p := eevdf.New(io, ncpu, eevdf.Enums{
 		EnqWakeup: 1, EnqPreempt: 1 << 32,
 	})
+	p.F = features
+	p.F.Normalize()
 	if err := p.SetTopology(readTopology("/sys/devices/system/cpu", ncpu)); err != nil {
 		return fmt.Errorf("CPU topology: %w", err)
 	}
 	var groups groupSync
 	samples := make([]eevdf.StatSample, ncpu)
+	governor := eevdf.NewFrequencyGovernor(ncpu, 10_000_000)
 	if err := s.Attach(); err != nil {
 		return err
 	}
@@ -138,6 +173,7 @@ func run(ctx context.Context, object string) error {
 	recoverUntil := uint64(0)
 	for ctx.Err() == nil {
 		count := 0
+		attached := make(map[int32]bool)
 		for ; count < 512; count++ {
 			var ev bpf.Ev
 			ok, err := s.Consume(&ev)
@@ -166,10 +202,20 @@ func run(ctx context.Context, object string) error {
 				WakeFlags: ev.WakeFlags, Policy: ev.Policy, EnqSeq: ev.EnqSeq,
 				Cgid: ev.Cgid,
 			})
+			if ev.Kind == eevdf.EvEnqueue {
+				if cpu, ok := p.TaskCPU(ev.Pid); ok {
+					attached[cpu] = true
+				}
+			}
 		}
 		p.Schedule()
+		if len(attached) != 0 {
+			updateFrequency(p, governor, io, clockNow(), ncpu, attached)
+		}
 		if now := clockNow(); now >= nextTick {
 			p.Periodic(now)
+			p.BalanceTick(now)
+			updateFrequency(p, governor, io, now, ncpu, nil)
 			nextTick = now + 1_000_000
 			if current := s.Counter("nr_ev_drops"); current != drops {
 				drops = current
@@ -209,10 +255,61 @@ func run(ctx context.Context, object string) error {
 
 func main() {
 	object := flag.String("bpf-object", "bpf/goeevdf.bpf.o", "compiled sched_ext BPF object")
+	shards := flag.String("shards", "auto", "per-LLC sharding above 64 possible CPUs (auto or 1)")
+	noWakePreempt := flag.Bool("no-wakeup-preempt", false, "disable wakeup preemption")
+	noEligibility := flag.Bool("no-eligibility", false, "disable EEVDF eligibility")
+	noEligibleScan := flag.Bool("no-eligible-scan", false, "disable eligible-tree scan")
+	noRunToParity := flag.Bool("no-run-to-parity", false, "disable run-to-parity protection")
+	noPreemptShort := flag.Bool("no-preempt-short", false, "disable short-request preemption")
+	noPlaceLag := flag.Bool("no-place-lag", false, "disable placement lag")
+	noPlaceDeadline := flag.Bool("no-place-rel-deadline", false, "disable relative-deadline placement")
+	noDelayDequeue := flag.Bool("no-delay-dequeue", false, "disable deferred dequeue")
+	noDelayRequeue := flag.Bool("no-delay-requeue", false, "disable deferred requeue")
+	noProxyExec := flag.Bool("no-proxy-exec", false, "disable blocked donor handling")
+	noHrtick := flag.Bool("no-hrtick", false, "disable hrtick preemption")
+	noSISUtil := flag.Bool("no-sis-util", false, "disable utilization-aware idle selection")
+	noNewidleCost := flag.Bool("no-newidle-cost", false, "disable idle search cost limit")
+	noNewidleSampling := flag.Bool("no-newidle-sampling", false, "disable idle search sampling")
+	noCapacityPressure := flag.Bool("no-capacity-pressure", false, "disable capacity pressure")
+	disableCgroups := flag.Bool("disable-cgroups", false, "disable cgroup weights and quotas")
+	disableCPUQuota := flag.Bool("disable-cpu-max", false, "disable cpu.max enforcement")
+	disableCpufreq := flag.Bool("disable-cpufreq", false, "disable CPU performance updates")
 	flag.Parse()
+	features := eevdf.DefaultFeatures()
+	features.WakeupPreempt = !*noWakePreempt
+	features.Eligibility = !*noEligibility
+	features.EligibleScan = !*noEligibleScan
+	features.RunToParity = !*noRunToParity
+	features.PreemptShort = !*noPreemptShort
+	features.PlaceLag = !*noPlaceLag
+	features.PlaceRelDeadline = !*noPlaceDeadline
+	features.DelayDequeue = !*noDelayDequeue
+	features.DelayRequeue = !*noDelayRequeue
+	features.ProxyExec = !*noProxyExec
+	features.Hrtick = !*noHrtick
+	features.SISUtil = !*noSISUtil
+	features.NewidleCost = !*noNewidleCost
+	features.NewidleSampling = !*noNewidleSampling
+	features.CapacityPressure = !*noCapacityPressure
+	features.Cgroups = !*disableCgroups
+	features.CpuMax = !*disableCPUQuota
+	features.Cpufreq = !*disableCpufreq
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := run(ctx, *object); err != nil && !errors.Is(err, context.Canceled) {
+	ncpu, err := possibleCPUs()
+	if err == nil {
+		topo := readTopology("/sys/devices/system/cpu", ncpu)
+		var groups [][]int32
+		groups, err = selectShardGroups(ncpu, topo, *shards)
+		if err == nil {
+			if groups == nil {
+				err = run(ctx, *object, features)
+			} else {
+				err = runSharded(ctx, *object, features, topo, groups)
+			}
+		}
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintln(os.Stderr, "goeevdf:", err)
 		os.Exit(1)
 	}

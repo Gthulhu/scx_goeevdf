@@ -52,7 +52,9 @@ func (s *CorePublisher) Release(p *Policy, t *Task) {
 	if io, ok := p.io.(publishIO); ok {
 		io.Publish(t.Slot, TaskPub{})
 	}
-	s.free = append(s.free, t.Slot)
+	if t.Slot < s.next {
+		s.free = append(s.free, t.Slot)
+	}
 	t.Slot = 0
 }
 

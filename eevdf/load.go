@@ -29,18 +29,18 @@ func (r *Ravg) read(now uint64, halfLife float64) float64 {
 }
 
 type taskLoadState struct {
-	run Ravg
+	run                                   Ravg
 	utilEst, runnableEst, wokeAt, sleptAt uint64
 }
 
 type cpuLoad struct {
-	run, load Ravg
+	run, load           Ravg
 	wakeLoad, idleStamp uint64
 }
 
 type Load struct {
-	p *Policy
-	cpus []cpuLoad
+	p     *Policy
+	cpus  []cpuLoad
 	tasks map[*Task]*taskLoadState
 }
 
@@ -55,7 +55,9 @@ func (l *Load) state(t *Task) *taskLoadState {
 
 func (l *Load) taskRunning(t *Task, running bool, now uint64) {
 	input := float64(0)
-	if running { input = 1 }
+	if running {
+		input = 1
+	}
 	l.state(t).run.accumulate(input, now, half)
 }
 
@@ -87,12 +89,16 @@ func (l *Load) taskUtil(t *Task, now uint64) uint64 {
 func (l *Load) taskLoad(t *Task, now uint64) uint64 {
 	s := l.state(t)
 	asleep := uint64(0)
-	if t.state == Sleeping { asleep = satSub(now, s.sleptAt) }
+	if t.state == Sleeping {
+		asleep = satSub(now, s.sleptAt)
+	}
 	return taskLoad(t.Weight, l.taskUtil(t, now), s.runnableEst, asleep)
 }
 func (l *Load) cpuRunning(c int32, running bool, now uint64) {
 	input := float64(0)
-	if running { input = 1 }
+	if running {
+		input = 1
+	}
 	l.cpus[c].run.accumulate(input, now, half)
 }
 func (l *Load) cpuUtil(c int32, now uint64) uint64 {

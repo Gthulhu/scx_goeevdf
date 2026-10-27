@@ -28,7 +28,7 @@ func (g GuardIO) Submit(cmd eevdf.Cmd) error {
 	return g.IO.Submit(cmd)
 }
 
-func (g GuardIO) Idle(cpu int32) bool { return g.IO.Idle(cpu) }
+func (g GuardIO) Idle(cpu int32) bool     { return g.IO.Idle(cpu) }
 func (g GuardIO) CurrPid(cpu int32) int32 { return g.IO.CurrPid(cpu) }
 
 func (g GuardIO) SetQueued(cpu int32, n, keepSlice uint64) {

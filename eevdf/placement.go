@@ -27,6 +27,11 @@ func (p *Policy) allowed(t *Task, cpu int32) bool {
 	return false
 }
 
+func (p *Policy) vacant(cpu int32) bool {
+	return p.valid(cpu) && p.io.Idle(cpu) && p.cpus[cpu].task == nil &&
+		p.trees[cpu].Len() == 0 && !p.act.cpus[cpu].reserved
+}
+
 func (p *Policy) selectCPU(t *Task, e Event, wake bool) int32 {
 	prev := e.Cpu
 	if !p.allowed(t, prev) {
@@ -36,28 +41,32 @@ func (p *Policy) selectCPU(t *Task, e Event, wake bool) int32 {
 				break
 			}
 		}
+		if t.Blocked {
+			return prev
+		}
 	}
 	if !wake || len(t.Allowed) == 0 {
 		return prev
 	}
 	// A delayed negative-lag task remains on its original pack while it owes
 	// service; moving it would incorrectly discard its virtual-time debt.
-	if d := t.delay; d.pack != nil && d.pack.emptyGen == d.gen && p.allowed(t, d.pack.CPU) {
+	if d := t.delay; p.F.DelayRequeue && d.pack != nil &&
+		d.pack.emptyGen == d.gen && p.allowed(t, d.pack.CPU) {
 		if delayDebt(t.lag, int64(d.pack.Ref-d.ref), d.sum, t.Weight) < 0 {
 			return d.pack.CPU
 		}
 	}
-	if p.io.Idle(prev) && p.cpus[prev].task == nil && p.trees[prev].Len() == 0 {
+	if p.vacant(prev) {
 		return prev
 	}
 	if p.valid(e.WakerCpu) && p.allowed(t, e.WakerCpu) &&
-		p.io.Idle(e.WakerCpu) && p.cpus[e.WakerCpu].task == nil && p.trees[e.WakerCpu].Len() == 0 {
+		p.topo.sameLLC(prev, e.WakerCpu) && p.vacant(e.WakerCpu) {
 		return e.WakerCpu
 	}
-	if provider, ok := p.io.(CapacityIO); ok {
+	if provider, ok := p.io.(CapacityIO); ok && p.F.SISUtil && p.F.CapacityPressure {
 		best, capacity := prev, uint64(0)
 		for _, c := range t.Allowed {
-			if p.valid(c) && p.io.Idle(c) && p.cpus[c].task == nil && p.trees[c].Len() == 0 &&
+			if p.vacant(c) &&
 				provider.Available(c) > capacity {
 				best, capacity = c, provider.Available(c)
 			}
@@ -66,9 +75,11 @@ func (p *Policy) selectCPU(t *Task, e Event, wake bool) int32 {
 			return best
 		}
 	}
-	for _, c := range t.Allowed {
-		if p.valid(c) && p.io.Idle(c) && p.cpus[c].task == nil && p.trees[c].Len() == 0 {
-			return c
+	for _, scope := range p.topo.newidleSpans(prev) {
+		for _, c := range scope {
+			if p.allowed(t, c) && p.vacant(c) {
+				return c
+			}
 		}
 	}
 	return prev

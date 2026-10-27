@@ -33,3 +33,7 @@ func (f *Features) Normalize() {
 		f.CpuMax = false
 	}
 }
+
+func (p *Policy) placeTask(t *Task, cpu int32, sleep bool) {
+	p.packs[cpu].placeWith(t, sleep, p.F.PlaceLag, p.F.PlaceRelDeadline)
+}

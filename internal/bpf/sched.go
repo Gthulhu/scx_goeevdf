@@ -23,15 +23,17 @@ import (
 	"unsafe"
 )
 
-// Sched owns the attached scheduler. Close only after the event loop exits.
-// Consume and Submit are intended for one scheduler goroutine locked to an OS thread.
+// Sched owns the attached scheduler. Close only after all shard loops exit.
+// Each shard must have exactly one ConsumeShard consumer and SubmitShard producer.
 type Sched struct {
-	handle *C.struct_ge_handle
-	CPU    []CpuSlot // BPF writes; use atomic loads for concurrently changing fields.
-	Ctl    []CpuCtl  // Go writes; use atomic stores.
-	Task   []TaskPub // Go writes; publish multi-field updates with an odd/even Seq.
-	maps   [][]byte
-	bss    []byte
+	handle   *C.struct_ge_handle
+	CPU      []CpuSlot // BPF writes; use atomic loads for concurrently changing fields.
+	Ctl      []CpuCtl  // Go writes; use atomic stores.
+	Task     []TaskPub // Go writes; publish multi-field updates with an odd/even Seq.
+	maps     [][]byte
+	bss      []byte
+	cpuShard []uint32
+	nrShards int
 }
 
 // Open loads the default object path; GOEEVDF_BPF_OBJECT can override it.
@@ -50,12 +52,48 @@ func OpenPath(path string) (*Sched, error) {
 	if h == nil {
 		return nil, fmt.Errorf("open BPF object %q: %w", path, err)
 	}
-	return &Sched{handle: h}, nil
+	return &Sched{handle: h, nrShards: 1}, nil
 }
 
 // SetUserschedTgid must precede Load; it exempts the Go process from external dispatch.
 func (s *Sched) SetUserschedTgid(tgid uint32) error {
 	return check(C.ge_set_tgid(s.handle, C.uint32_t(tgid)))
+}
+
+// SetShards configures CPU-to-shard ownership before Load. Unspecified CPUs
+// belong to shard zero; each configured CPU must have a valid shard ID.
+func (s *Sched) SetShards(cpuShard []uint32, nr uint32) error {
+	if nr == 0 || nr > MaxShards || len(cpuShard) > MaxCPUs {
+		return syscall.EINVAL
+	}
+	for _, id := range cpuShard {
+		if id >= nr {
+			return syscall.EINVAL
+		}
+	}
+	var ptr *C.uint32_t
+	if len(cpuShard) != 0 {
+		ptr = (*C.uint32_t)(unsafe.Pointer(&cpuShard[0]))
+	}
+	if err := check(C.ge_set_shards(s.handle, ptr, C.uint32_t(len(cpuShard)), C.uint32_t(nr))); err != nil {
+		return err
+	}
+	s.cpuShard = append([]uint32(nil), cpuShard...)
+	s.nrShards = int(nr)
+	return nil
+}
+
+// RegisterUsersched assigns a Linux thread ID (not TGID) to its scheduler shard.
+// Call after Load and before the thread becomes runnable in sched_ext.
+func (s *Sched) RegisterUsersched(tid uint32, shard uint32) error {
+	return check(C.ge_register_usersched(s.handle, C.uint32_t(tid), C.uint32_t(shard)))
+}
+
+// DisableOp disables an optional struct_ops callback before Load.
+func (s *Sched) DisableOp(name string) error {
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	return check(C.ge_disable_op(s.handle, cname))
 }
 
 func check(code C.int) error {
@@ -119,7 +157,15 @@ func (s *Sched) Attach() error {
 // Consume reads at most one event without blocking. The caller must not run
 // another Consume on this Sched concurrently.
 func (s *Sched) Consume(out *Ev) (bool, error) {
-	code := C.ge_consume(s.handle, (*C.struct_ev)(unsafe.Pointer(out)))
+	return s.ConsumeShard(0, out)
+}
+
+// ConsumeShard reads at most one event from this shard without blocking.
+func (s *Sched) ConsumeShard(id int, out *Ev) (bool, error) {
+	if id < 0 || id >= s.nrShards {
+		return false, syscall.EINVAL
+	}
+	code := C.ge_consume_shard(s.handle, C.uint32_t(id), (*C.struct_ev)(unsafe.Pointer(out)))
 	runtime.KeepAlive(s)
 	if code < 0 {
 		return false, check(code)
@@ -127,12 +173,32 @@ func (s *Sched) Consume(out *Ev) (bool, error) {
 	return code == 1, nil
 }
 
-// Submit queues a command and kicks its target CPU to trigger BPF dispatch.
-// ENOSPC means the user ring is full. A kick failure does not invalidate a
-// submitted command, so Submit must not report it as an error (the next
-// dispatch callback will still drain the ring).
+// Submit queues dispatch/control commands and kicks their target CPU.
+// Hrtick commands execute immediately through a syscall program so a running
+// CPU need not be preempted just to arm its timer. ENOSPC means the user ring
+// is full. A kick failure does not invalidate a queued command.
 func (s *Sched) Submit(c *Cmd) error {
-	code := C.ge_submit(s.handle, (*C.struct_cmd)(unsafe.Pointer(c)))
+	return s.SubmitShard(s.ShardForCPU(c.Cpu), c)
+}
+
+// ShardForCPU reports configured ownership; unknown CPUs belong to shard 0.
+func (s *Sched) ShardForCPU(cpu int32) int {
+	if cpu >= 0 && int(cpu) < len(s.cpuShard) {
+		return int(s.cpuShard[cpu])
+	}
+	return 0
+}
+
+// SubmitShard rejects commands targeting CPUs outside this shard.
+func (s *Sched) SubmitShard(id int, c *Cmd) error {
+	if id < 0 || id >= s.nrShards || c.Cpu < 0 || c.Cpu >= MaxCPUs ||
+		s.ShardForCPU(c.Cpu) != id {
+		return syscall.EINVAL
+	}
+	if c.Kind == CmdHrtick {
+		return check(C.ge_hrtick(s.handle, C.int32_t(c.Cpu), C.uint32_t(c.Slot), C.uint64_t(c.Slice)))
+	}
+	code := C.ge_submit_shard(s.handle, C.uint32_t(id), (*C.struct_cmd)(unsafe.Pointer(c)))
 	runtime.KeepAlive(s)
 	if err := check(code); err != nil {
 		return err
@@ -171,19 +237,105 @@ func (s *Sched) Counter(name string) uint64 {
 	return 0
 }
 func (s *Sched) DecNrQueued(n uint64) {
-	if p := s.counter("nr_queued"); p != nil {
-		for {
-			old := atomic.LoadUint64(p)
-			if atomic.CompareAndSwapUint64(p, old, old-min(old, n)) {
-				return
-			}
+	s.DecNrQueuedShard(0, n)
+}
+func (s *Sched) shardCounter(name string, id int) *uint64 {
+	if id < 0 || id >= s.nrShards {
+		return nil
+	}
+	p := s.counter(name)
+	if p == nil || int(uintptr(unsafe.Pointer(p))-uintptr(unsafe.Pointer(&s.bss[0])))+8*(id+1) > len(s.bss) {
+		return nil
+	}
+	return (*uint64)(unsafe.Add(unsafe.Pointer(p), id*8))
+}
+func decCounter(p *uint64, n uint64) {
+	if p == nil {
+		return
+	}
+	for {
+		old := atomic.LoadUint64(p)
+		if atomic.CompareAndSwapUint64(p, old, old-min(old, n)) {
+			return
 		}
 	}
 }
-func (s *Sched) SetNrScheduled(n uint64) {
-	if p := s.counter("nr_scheduled"); p != nil {
-		atomic.StoreUint64(p, n)
+func (s *Sched) DecNrQueuedShard(id int, n uint64) {
+	decCounter(s.shardCounter("nr_queued_s", id), n)
+	if id < 0 || id >= s.nrShards {
+		return
 	}
+	decCounter(s.counter("nr_queued"), n)
+}
+func (s *Sched) SetNrScheduledShard(id int, n uint64) {
+	if p := s.shardCounter("nr_scheduled_s", id); p != nil {
+		old := atomic.SwapUint64(p, n)
+		if total := s.counter("nr_scheduled"); total != nil {
+			atomic.AddUint64(total, n-old)
+		}
+	}
+}
+func (s *Sched) SetNeededShard(id int) {
+	if p := s.shardCounter("needed_s", id); p != nil {
+		atomic.StoreUint64(p, 1)
+	}
+}
+func (s *Sched) NrQueuedShard(id int) uint64 {
+	if p := s.shardCounter("nr_queued_s", id); p != nil {
+		return atomic.LoadUint64(p)
+	}
+	return 0
+}
+func (s *Sched) SetNrScheduled(n uint64) {
+	s.SetNrScheduledShard(0, n)
+}
+
+// Publish updates a task's shared core-scheduling and debug fields. The
+// scheduler goroutine is the sole writer; slot zero is reserved.
+func (s *Sched) Publish(slot uint32, pub TaskPub) {
+	if slot == 0 || int(slot) >= len(s.Task) {
+		return
+	}
+	dst := &s.Task[slot]
+	seq := atomic.LoadUint64(&dst.Seq)
+	atomic.StoreUint64(&dst.Seq, seq+1)
+	dst.Pid = pub.Pid
+	dst.CoreVtime = pub.CoreVtime
+	dst.Vruntime = pub.Vruntime
+	dst.Deadline = pub.Deadline
+	dst.Lag = pub.Lag
+	dst.Weight = pub.Weight
+	dst.PublishedAt = 0
+	if pub.Pid != 0 {
+		// Charging may precede publication, so starting projection at the
+		// publication clock prevents counting that charged interval twice.
+		var ts syscall.Timespec
+		_, _, errno := syscall.RawSyscall(syscall.SYS_CLOCK_GETTIME, 1, uintptr(unsafe.Pointer(&ts)), 0)
+		dst.PublishedAt = ^uint64(0)
+		if errno == 0 && ts.Sec >= 0 && ts.Nsec >= 0 {
+			dst.PublishedAt = uint64(ts.Sec)*1e9 + uint64(ts.Nsec)
+		}
+	}
+	atomic.StoreUint64(&dst.Seq, seq+2)
+}
+
+func (s *Sched) RunSeq(cpu int32) uint64 {
+	if cpu < 0 || int(cpu) >= len(s.CPU) {
+		return 0
+	}
+	return atomic.LoadUint64(&s.CPU[cpu].RunSeq)
+}
+
+// SetPerf publishes a scheduler performance target (1..1024); zero disables
+// tick-based updates on that CPU.
+func (s *Sched) SetPerf(cpu int32, perf uint64) {
+	if cpu < 0 || int(cpu) >= len(s.Ctl) {
+		return
+	}
+	if perf > 1024 {
+		perf = 1024
+	}
+	atomic.StoreUint64(&s.Ctl[cpu].PerfTarget, perf)
 }
 
 func (s *Sched) Yield() error {

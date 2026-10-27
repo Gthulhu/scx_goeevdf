@@ -76,7 +76,12 @@ func (p *Policy) RemoveCgroup(id uint64) {
 	}
 }
 
-func (p *Policy) group(t *Task) *Group { return p.groups[t.Cgid] }
+func (p *Policy) group(t *Task) *Group {
+	if !p.F.Cgroups {
+		return nil
+	}
+	return p.groups[t.Cgid]
+}
 
 func (p *Policy) recomputeWeights(cpu int32) {
 	pk := p.packs[cpu]

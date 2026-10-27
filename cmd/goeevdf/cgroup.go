@@ -82,19 +82,16 @@ func readQuota(path string) (quota, period uint64, err error) {
 }
 
 func (s *groupSync) configure(p *eevdf.Policy, path string) error {
-	if path == "/sys/fs/cgroup" {
-		return nil
-	}
 	id, err := cgroupID(path)
 	if err != nil {
 		return err
 	}
-	parent := filepath.Dir(path)
-	if err := s.configure(p, parent); err != nil {
-		return err
-	}
 	parentID := uint64(0)
-	if parent != "/sys/fs/cgroup" {
+	if path != "/sys/fs/cgroup" {
+		parent := filepath.Dir(path)
+		if err := s.configure(p, parent); err != nil {
+			return err
+		}
 		parentID, err = cgroupID(parent)
 		if err != nil {
 			return err

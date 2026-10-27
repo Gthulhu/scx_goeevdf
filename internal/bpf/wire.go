@@ -7,8 +7,9 @@ import "C"
 import "unsafe"
 
 const (
-	MaxCPUs  = 1024
-	MaxTasks = 65536
+	MaxCPUs   = 1024
+	MaxTasks  = 65536
+	MaxShards = 32
 
 	EvEnqueue    = 1
 	EvSleep      = 2
@@ -71,7 +72,7 @@ type TaskPub struct {
 	_                             uint32
 	CoreVtime, Vruntime, Deadline uint64
 	Lag                           int64
-	Weight                        uint64
+	Weight, PublishedAt           uint64
 }
 
 var (

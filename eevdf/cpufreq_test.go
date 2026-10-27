@@ -56,6 +56,8 @@ func TestFrequencyGovernorTransitionsAndRateLimit(t *testing.T) {
 	if g.Target(0) != 1024 || g.Target(1) != 640 {
 		t.Fatalf("per-CPU targets: %d, %d", g.Target(0), g.Target(1))
 	}
+	check(1, 2, 100, 1024, 2, false, 640, false)
+	check(1, 5_000_001, 100, 1024, 2, false, 1024, true)
 }
 
 func TestFrequencyGovernorClockResetAndInvalidCPU(t *testing.T) {

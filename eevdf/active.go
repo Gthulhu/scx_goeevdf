@@ -11,12 +11,12 @@ const (
 )
 
 type actCPU struct {
-	reserved bool
+	reserved                   bool
 	reservedAt, interval, next uint64
 }
 type Active struct {
-	p *Policy
-	cpus []actCPU
+	p       *Policy
+	cpus    []actCPU
 	migrate map[*Task]int32
 }
 
@@ -28,13 +28,19 @@ func (a *Active) bestDestination(t *Task, src int32, now uint64) (int32, int) {
 	p := a.p
 	best := int32(-1)
 	for _, dst := range t.Allowed {
-		if !p.valid(dst) || dst == src || !a.vacant(dst) { continue }
+		if !p.valid(dst) || dst == src || !a.vacant(dst) {
+			continue
+		}
 		if p.topo.Capacity[dst] > p.topo.Capacity[src] &&
 			p.ld.taskUtil(t, now)*1280 >= p.topo.Capacity[src]*1024 {
-			if best < 0 || p.topo.Capacity[dst] > p.topo.Capacity[best] { best = dst }
+			if best < 0 || p.topo.Capacity[dst] > p.topo.Capacity[best] {
+				best = dst
+			}
 		}
 	}
-	if best >= 0 { return best, imbCapacity }
+	if best >= 0 {
+		return best, imbCapacity
+	}
 	if p.topo.SMT {
 		busySibling := false
 		for c := range p.cpus {
@@ -48,7 +54,9 @@ func (a *Active) bestDestination(t *Task, src int32, now uint64) (int32, int) {
 		if busySibling {
 			for _, dst := range t.Allowed {
 				if !p.valid(dst) || !p.topo.sameLLC(dst, src) ||
-					p.topo.sameCore(dst, src) || !a.vacant(dst) { continue }
+					p.topo.sameCore(dst, src) || !a.vacant(dst) {
+					continue
+				}
 				whole := true
 				for c := range p.cpus {
 					cpu := int32(c)
@@ -57,7 +65,9 @@ func (a *Active) bestDestination(t *Task, src int32, now uint64) (int32, int) {
 						break
 					}
 				}
-				if whole { return dst, imbLocalSMT }
+				if whole {
+					return dst, imbLocalSMT
+				}
 			}
 		}
 	}
@@ -68,8 +78,12 @@ func (a *Active) bestDestination(t *Task, src int32, now uint64) (int32, int) {
 // the transfer; the destination reservation prevents duplicate stop requests.
 func (a *Active) request(t *Task, src, dst int32, now uint64) bool {
 	st := &a.cpus[dst]
-	if st.reserved || now < st.next { return false }
-	if _, pending := a.migrate[t]; pending { return false }
+	if st.reserved || now < st.next {
+		return false
+	}
+	if _, pending := a.migrate[t]; pending {
+		return false
+	}
 	if err := a.p.io.Submit(Cmd{Kind: CmdStop, Pid: t.Pid, Cpu: src}); err != nil {
 		a.miss(dst, now)
 		return false
@@ -91,15 +105,21 @@ func (a *Active) run(now uint64) {
 	for c := range a.p.cpus {
 		src := int32(c)
 		t := a.p.cpus[c].task
-		if t == nil || len(t.Allowed) < 2 { continue }
+		if t == nil || t.Blocked || len(t.Allowed) < 2 {
+			continue
+		}
 		dst, kind := a.bestDestination(t, src, now)
-		if kind != imbNone { a.request(t, src, dst, now) }
+		if kind != imbNone {
+			a.request(t, src, dst, now)
+		}
 	}
 }
 
 func (a *Active) handedOver(t *Task, now uint64) (int32, bool) {
 	dst, ok := a.migrate[t]
-	if !ok { return 0, false }
+	if !ok {
+		return 0, false
+	}
 	delete(a.migrate, t)
 	a.cpus[dst].reserved = false
 	a.cpus[dst].interval = 0
@@ -113,20 +133,37 @@ func (a *Active) miss(dst int32, now uint64) {
 }
 
 func (a *Active) newidleRequest(dst int32, now uint64) {
-	if a.cpus[dst].reserved || !a.vacant(dst) { return }
+	if a.cpus[dst].reserved || !a.vacant(dst) {
+		return
+	}
 	var donor *Task
 	var source int32
 	var heaviest uint64
 	for c := range a.p.cpus {
 		src := int32(c)
 		t := a.p.cpus[c].task
-		if t == nil || src == dst || !a.p.allowed(t, dst) || a.p.trees[src].Len() != 0 { continue }
+		if t == nil || t.Blocked || src == dst || !a.p.allowed(t, dst) || a.p.trees[src].Len() != 0 {
+			continue
+		}
+		lv := lvSystem
+		if a.p.topo.sameLLC(src, dst) {
+			lv = lvLLC
+		} else if a.p.topo.sameNode(src, dst) {
+			lv = lvNode
+		}
+		if a.p.bal.cpus[dst].failed[lv] <= 3 {
+			continue
+		}
 		// Prefer a busy source in the closest topology domain.
 		load := a.p.ld.taskLoad(t, now)
-		if a.p.topo.sameLLC(src, dst) { load += Nice0Weight }
+		if a.p.topo.sameLLC(src, dst) {
+			load += Nice0Weight
+		}
 		if donor == nil || load > heaviest {
 			donor, source, heaviest = t, src, load
 		}
 	}
-	if donor != nil { a.request(donor, source, dst, now) }
+	if donor != nil {
+		a.request(donor, source, dst, now)
+	}
 }

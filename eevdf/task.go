@@ -14,6 +14,7 @@ type Task struct {
 	Vruntime    uint64
 	Req         Request
 	Slot        uint32
+	Blocked     bool
 
 	seq     uint64
 	node    *node

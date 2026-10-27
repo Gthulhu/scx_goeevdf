@@ -33,7 +33,7 @@ func (p *Policy) shouldPreemptWith(w *Task, cpu int32, f Features) bool {
 	if !TimeBefore(w.Req.Deadline, cur.Req.Deadline) {
 		return false
 	}
-	if !f.EligibleScan {
+	if !f.Eligibility || !f.EligibleScan {
 		return true
 	}
 	p.trees[cpu].Remove(w)

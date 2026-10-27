@@ -3,6 +3,7 @@
 
 #define MAX_CPUS 1024
 #define MAX_TASKS 65536
+#define MAX_SHARDS 32
 
 enum ev_kind {
 	EV_ENQUEUE = 1, EV_SLEEP, EV_DEQUEUE, EV_EXIT, EV_KEEP, EV_IDLE,
@@ -44,11 +45,11 @@ struct task_pub {
 	u32 pad;
 	u64 core_vtime, vruntime, deadline;
 	s64 lag;
-	u64 weight;
+	u64 weight, published_at;
 };
 _Static_assert(sizeof(struct ev) == 128, "ev size");
 _Static_assert(sizeof(struct cmd) == 64, "cmd size");
 _Static_assert(sizeof(struct cpu_slot) == 64, "cpu_slot size");
 _Static_assert(sizeof(struct cpu_ctl) == 64, "cpu_ctl size");
-_Static_assert(sizeof(struct task_pub) == 56, "task_pub size");
+_Static_assert(sizeof(struct task_pub) == 64, "task_pub size");
 #endif

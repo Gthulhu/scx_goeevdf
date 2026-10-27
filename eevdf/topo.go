@@ -12,8 +12,8 @@ const (
 // Topology describes dense policy CPU IDs. Equal IDs identify shared cores,
 // last-level caches and NUMA nodes; capacities are in scheduler units.
 type Topology struct {
-	Core, LLC, Node []int
-	Capacity        []uint64
+	Core, LLC, Node   []int
+	Capacity          []uint64
 	SMT, AsymCapacity bool
 }
 
@@ -67,7 +67,7 @@ func (p *Policy) SetTopology(t Topology) error {
 }
 
 func (t Topology) sameCore(a, b int32) bool { return t.Core[a] == t.Core[b] }
-func (t Topology) sameLLC(a, b int32) bool { return t.LLC[a] == t.LLC[b] }
+func (t Topology) sameLLC(a, b int32) bool  { return t.LLC[a] == t.LLC[b] }
 func (t Topology) sameNode(a, b int32) bool { return t.Node[a] == t.Node[b] }
 
 // newidleSpans partitions donor CPUs by increasing distance from dst.

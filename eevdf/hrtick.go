@@ -6,7 +6,7 @@ const (
 	CmdfHrtick  uint32 = 1
 )
 
-type nowIO interface{ Now() uint64 }
+type runStartIO interface{ RunStart(cpu int32) uint64 }
 
 // Hrtick tracks the earliest pending timer for each CPU. The BPF timer checks
 // run_seq, so a timer from a previous run can safely expire without kicking it.
@@ -23,7 +23,8 @@ func NewHrtick(p *Policy) *Hrtick {
 func (h *Hrtick) start(c int32, now uint64) {
 	p := h.p
 	if !h.Enabled || !p.valid(c) || p.cpus[c].task == nil ||
-		p.trees[c].Len() == 0 || p.cpus[c].task.Weight == 0 {
+		p.trees[c].Len() == 0 || p.cpus[c].task.Weight == 0 ||
+		p.io.CurrPid(c) != p.cpus[c].task.Pid {
 		return
 	}
 	cur := p.cpus[c].task
@@ -32,6 +33,15 @@ func (h *Hrtick) start(c int32, now uint64) {
 		return
 	}
 	in := uint64(remaining) * cur.Weight / Nice0Weight
+	if start, ok := p.io.(runStartIO); ok {
+		if since := start.RunStart(c); since != 0 && now >= since {
+			elapsed := now - since
+			if elapsed >= in {
+				return
+			}
+			in -= elapsed
+		}
+	}
 	if in < hrtickMinNs {
 		return
 	}
