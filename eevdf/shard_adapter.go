@@ -5,6 +5,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"sync"
 )
 
 // ShardPolicy owns one Policy with dense local CPU indices. Only its owning
@@ -21,6 +22,26 @@ type ShardPolicy struct {
 // ErrTaskNotTransferable indicates a normal ownership state that must remain
 // on its source until a kernel event makes it pending. It is not corruption.
 var ErrTaskNotTransferable = errors.New("task is not safely transferable")
+
+var shardQuotaPools = struct {
+	sync.Mutex
+	next uint64
+	ids  map[*SharedQuotaPool]uint64
+}{ids: make(map[*SharedQuotaPool]uint64)}
+
+// shardQuotaPoolID identifies an in-process pool without serializing a Go
+// pointer into the task image. IDs are used only for handoff validation.
+func shardQuotaPoolID(pool *SharedQuotaPool) uint64 {
+	shardQuotaPools.Lock()
+	defer shardQuotaPools.Unlock()
+	if id := shardQuotaPools.ids[pool]; id != 0 {
+		return id
+	}
+	shardQuotaPools.next++
+	id := shardQuotaPools.next
+	shardQuotaPools.ids[pool] = id
+	return id
+}
 
 type shardIO struct {
 	s *ShardPolicy
@@ -175,7 +196,7 @@ func (s *ShardPolicy) CanTransfer(pid, slot int32) bool {
 		return false
 	}
 	for g := p.group(t); g != nil; g = g.Parent {
-		if g.bw != nil {
+		if g.bw != nil && (g.bw.owner == nil || g.bw.owner != p.sharedQuota) {
 			return false
 		}
 	}
@@ -218,6 +239,8 @@ type shardTaskImage struct {
 	Allowed                                 []int32
 	AffinityKnown                           bool
 	GroupConfigured                         bool
+	PoolID                                  uint64
+	Groups                                  []shardGroupImage
 	Vruntime                                uint64
 	Req                                     Request
 	Lag                                     int64
@@ -229,10 +252,15 @@ type shardTaskImage struct {
 	UtilEst, RunnableEst, WokeAt, SleptAt   uint64
 }
 
+type shardGroupImage struct {
+	ID, Weight, Quota, Period uint64
+	HasQuota                  bool
+}
+
 // Export removes a queued or sleeping task from its source policy, preserving
 // virtual lag and PELT task history. Running and quota-parked tasks cannot be
-// exported: the kernel must first stop a running task, and cpu.max pool state
-// is not shared across Policies yet. On failure the source remains unchanged.
+// exported; queued tasks with quotas require a shared pool on every ancestor.
+// On failure the source remains unchanged.
 func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 	p := s.Policy
 	t := p.tasks[pid]
@@ -245,11 +273,6 @@ func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 	if _, active := p.act.migrate[t]; active || t.backlog != nil || t.Blocked {
 		return nil, fmt.Errorf("%w: PID %d has active, proxy, or bandwidth state", ErrTaskNotTransferable, pid)
 	}
-	for g := p.group(t); g != nil; g = g.Parent {
-		if g.bw != nil {
-			return nil, fmt.Errorf("%w: PID %d has quota-controlled state", ErrTaskNotTransferable, pid)
-		}
-	}
 	img := shardTaskImage{
 		Pid: t.Pid, Tgid: t.Tgid, CPU: s.global[t.Cpu], Slot: t.Slot,
 		EnqSeq: t.EnqSeq, Weight: t.Weight, Nice: t.Nice, Cgid: t.Cgid,
@@ -257,7 +280,18 @@ func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 		Req: t.Req, Lag: t.lag, Initial: t.initial, Blocked: t.Blocked,
 		LastSum:         t.lastSum,
 		Queued:          t.state == Queued,
-		GroupConfigured: p.groups[t.Cgid] != nil,
+		GroupConfigured: p.F.Cgroups && p.groups[t.Cgid] != nil,
+	}
+	for g := p.group(t); g != nil; g = g.Parent {
+		group := shardGroupImage{ID: g.ID, Weight: g.Weight}
+		if b := g.bw; b != nil {
+			if b.owner == nil || b.owner != p.sharedQuota {
+				return nil, fmt.Errorf("%w: PID %d has unshared quota state", ErrTaskNotTransferable, pid)
+			}
+			group.HasQuota, group.Quota, group.Period = true, b.quota, b.period
+			img.PoolID = shardQuotaPoolID(b.owner)
+		}
+		img.Groups = append(img.Groups, group)
 	}
 	for _, c := range t.Allowed {
 		img.Allowed = append(img.Allowed, s.global[c])
@@ -324,8 +358,32 @@ func (s *ShardPolicy) Import(pid, slot, cpu int32, image []byte) error {
 	if !img.AffinityKnown && img.CPU != cpu {
 		return fmt.Errorf("PID %d cannot migrate without a verified affinity mask", pid)
 	}
-	if img.GroupConfigured && s.Policy.groups[img.Cgid] == nil {
-		return fmt.Errorf("destination lacks cgroup %d for PID %d", img.Cgid, pid)
+	p := s.Policy
+	if img.GroupConfigured != (p.F.Cgroups && p.groups[img.Cgid] != nil) {
+		return fmt.Errorf("destination cgroup %d configuration differs for PID %d", img.Cgid, pid)
+	}
+	g := p.groups[img.Cgid]
+	if !p.F.Cgroups {
+		g = nil
+	}
+	for _, ancestor := range img.Groups {
+		if g == nil || g.ID != ancestor.ID || g.Weight != ancestor.Weight ||
+			(g.bw != nil) != ancestor.HasQuota {
+			return fmt.Errorf("destination cgroup ancestry differs for PID %d", pid)
+		}
+		if ancestor.HasQuota {
+			b := g.bw
+			if p.sharedQuota == nil || img.PoolID == 0 ||
+				shardQuotaPoolID(p.sharedQuota) != img.PoolID ||
+				b.owner != p.sharedQuota || b.shared == nil ||
+				b.quota != ancestor.Quota || b.period != ancestor.Period {
+				return fmt.Errorf("destination quota pool differs for PID %d", pid)
+			}
+		}
+		g = g.Parent
+	}
+	if g != nil || len(img.Groups) == 0 && img.PoolID != 0 {
+		return fmt.Errorf("destination cgroup ancestry incomplete for PID %d", pid)
 	}
 	if img.AffinityKnown {
 		permitted := false
@@ -345,7 +403,6 @@ func (s *ShardPolicy) Import(pid, slot, cpu int32, image []byte) error {
 	if len(img.Allowed) != 0 && len(allowed) == 0 {
 		return fmt.Errorf("PID %d has no affinity in destination shard", pid)
 	}
-	p := s.Policy
 	t := &Task{Pid: pid, Tgid: img.Tgid, Cpu: local, Slot: uint32(slot),
 		EnqSeq: img.EnqSeq, Weight: img.Weight, Nice: img.Nice, Cgid: img.Cgid,
 		CustomSlice: img.CustomSlice, Policy: img.Policy, Allowed: allowed,

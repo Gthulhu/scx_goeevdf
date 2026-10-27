@@ -90,6 +90,67 @@ func TestShardExportRefusesUnsharedQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	func TestShardPendingQuotaImageRequiresSameConfiguredPool(t *testing.T) {
+		first := NewSharedQuotaPool()
+		other := NewSharedQuotaPool()
+		for _, pool := range []*SharedQuotaPool{first, other} {
+			for _, q := range []struct{ id, quota uint64 }{{7, 100_000}, {8, 50_000}} {
+				if err := pool.Configure(q.id, q.quota, 10_000_000); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		newPolicy := func(cpu int32, pool *SharedQuotaPool, withChildQuota bool) *ShardPolicy {
+			t.Helper()
+			s, err := NewShardPolicy(shardTestIO{}, []int32{cpu}, Enums{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := pool.Bind(s.Policy); err != nil {
+				t.Fatal(err)
+			}
+			for _, group := range []struct{ id, parent uint64 }{{7, 0}, {8, 7}} {
+				if err := s.Policy.SetCgroup(group.id, group.parent, 100); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := s.Policy.SetCPUQuota(7, 100_000, 10_000_000); err != nil {
+				t.Fatal(err)
+			}
+			if withChildQuota {
+				if err := s.Policy.SetCPUQuota(8, 50_000, 10_000_000); err != nil {
+					t.Fatal(err)
+				}
+			}
+			return s
+		}
+		src := newPolicy(4, first, true)
+		dst := newPolicy(8, first, true)
+		wrongPool := newPolicy(8, other, true)
+		missingQuota := newPolicy(8, first, false)
+		if err := src.Handle(33, Event{Kind: EvEnqueue, Pid: 33, Cpu: 4, Cgid: 8, Weight: 100}); err != nil {
+			t.Fatal(err)
+		}
+		image, err := src.Export(33, 33)
+		if err != nil {
+			t.Fatal("shared quota queued task could not export:", err)
+		}
+		if src.Policy.tasks[33] != nil {
+			t.Fatal("source still owns exported task")
+		}
+		for _, bad := range []*ShardPolicy{wrongPool, missingQuota} {
+			if err := bad.Import(33, 33, 8, image); err == nil || bad.Policy.tasks[33] != nil {
+				t.Fatal("destination imported task without matching ancestor quotas and pool")
+			}
+		}
+		if err := dst.Import(33, 33, 8, image); err != nil {
+			t.Fatal("matching shared quota destination rejected:", err)
+		}
+		if dst.Policy.tasks[33] == nil || dst.Policy.trees[0].Len() != 1 {
+			t.Fatal("destination did not adopt queued quota task")
+		}
+	}
 	if err := s.Policy.SetCgroup(7, 0, 100); err != nil {
 		t.Fatal(err)
 	}
