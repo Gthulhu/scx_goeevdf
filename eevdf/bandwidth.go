@@ -27,6 +27,9 @@ func (p *Policy) SetCPUQuota(id, quota, period uint64) error {
 	}
 	if quota == 0 {
 		g.bw = nil
+		for c := range p.cpus {
+			p.syncQueued(int32(c))
+		}
 		if old != nil {
 			for len(old.backlog) != 0 {
 				t := old.backlog[0]
@@ -47,6 +50,9 @@ func (p *Policy) SetCPUQuota(id, quota, period uint64) error {
 	}
 	g.bw = bw
 	p.bandwidth = append(p.bandwidth, bw)
+	for c := range p.cpus {
+		p.syncQueued(int32(c))
+	}
 	p.unpark()
 	return nil
 }

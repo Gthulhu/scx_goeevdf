@@ -15,6 +15,7 @@ import (
 type groupSync struct {
 	last    map[uint64]time.Time
 	applied map[uint64]groupConfig
+	paths   map[uint64]string
 }
 
 type groupConfig struct {
@@ -123,7 +124,23 @@ func (s *groupSync) configure(p *eevdf.Policy, path string) error {
 		s.applied = make(map[uint64]groupConfig)
 	}
 	s.applied[id] = config
+	if s.paths == nil {
+		s.paths = make(map[uint64]string)
+	}
+	s.paths[id] = path
 	return nil
+}
+
+func (s *groupSync) refresh(p *eevdf.Policy, id uint64) {
+	path := s.paths[id]
+	if path == "" {
+		return
+	}
+	if actual, err := cgroupID(path); err == nil && actual == id {
+		if s.configure(p, path) == nil {
+			s.last[id] = time.Now()
+		}
+	}
 }
 
 func (s *groupSync) sync(p *eevdf.Policy, pid int32, id uint64) {

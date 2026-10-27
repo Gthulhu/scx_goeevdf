@@ -41,6 +41,10 @@ func (b backend) CurrPid(cpu int32) int32 {
 	return int32(atomic.LoadUint32(&b.sched.CPU[cpu].CurrPid))
 }
 
+func (b backend) RunSeq(cpu int32) uint64 {
+	return atomic.LoadUint64(&b.sched.CPU[cpu].RunSeq)
+}
+
 func (b backend) Available(cpu int32) uint64 {
 	return b.pressure.Available(cpu)
 }
@@ -127,6 +131,8 @@ func run(ctx context.Context, object string) error {
 	}
 	nextTick := clockNow()
 	nextPressure := nextTick
+	drops := s.Counter("nr_ev_drops")
+	recoverUntil := uint64(0)
 	for ctx.Err() == nil {
 		count := 0
 		for ; count < 512; count++ {
@@ -145,6 +151,9 @@ func run(ctx context.Context, object string) error {
 				p.RemoveCgroup(ev.Cgid)
 				delete(groups.last, ev.Cgid)
 				delete(groups.applied, ev.Cgid)
+				delete(groups.paths, ev.Cgid)
+			} else if ev.Kind == bpf.EvCgrpWeight || ev.Kind == bpf.EvCgrpBW {
+				groups.refresh(p, ev.Cgid)
 			}
 			p.Handle(eevdf.Event{
 				Kind: ev.Kind, Pid: ev.Pid, Tgid: ev.Tgid, Cpu: ev.Cpu,
@@ -159,6 +168,14 @@ func run(ctx context.Context, object string) error {
 		if now := clockNow(); now >= nextTick {
 			p.Periodic(now)
 			nextTick = now + 1_000_000
+			if current := s.Counter("nr_ev_drops"); current != drops {
+				drops = current
+				recoverUntil = now + 1_000_000_000
+			}
+			if now < recoverUntil {
+				p.ReconcileDropped()
+				p.Schedule()
+			}
 			if now >= nextPressure {
 				if data, err := os.ReadFile("/proc/stat"); err == nil {
 					if eevdf.ParseProcStat(data, samples, 100) == nil {

@@ -27,7 +27,11 @@ func (p *Policy) pull(dst int32) {
 		}
 		if t != nil {
 			p.removeQueued(t)
+			t.state = Sleeping
 			p.packs[dst].place(t, false)
+			t.Cpu = dst
+			p.recomputeWeights(src)
+			p.recomputeWeights(dst)
 			p.dispatch(t, dst, false)
 			return
 		}

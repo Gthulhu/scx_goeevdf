@@ -51,6 +51,11 @@ type Enums struct {
 type cpuState struct {
 	task    *Task
 	protect uint64
+	runSeq  uint64
+}
+
+type runSeqIO interface {
+	RunSeq(cpu int32) uint64
 }
 
 type Policy struct {
@@ -84,7 +89,19 @@ func New(io IO, cpus int, enums Enums) *Policy {
 func (p *Policy) valid(cpu int32) bool { return cpu >= 0 && int(cpu) < len(p.cpus) }
 
 func (p *Policy) syncQueued(c int32) {
-	p.io.SetQueued(c, uint64(p.trees[c].Len()), p.Slice)
+	n := uint64(p.trees[c].Len())
+	// A quota-limited current task must return to Go at the end of its
+	// dispatched slice, even if the EDQ is empty. Otherwise the BPF keep
+	// shortcut could run it indefinitely without charging cpu.max.
+	if t := p.cpus[c].task; t != nil {
+		for g := p.group(t); g != nil; g = g.Parent {
+			if g.bw != nil {
+				n++
+				break
+			}
+		}
+	}
+	p.io.SetQueued(c, n, p.Slice)
 }
 
 func (p *Policy) removeQueued(t *Task) {
@@ -215,6 +232,7 @@ func (p *Policy) enqueue(e Event) {
 	wasCurr := p.valid(from) && p.cpus[from].task == t
 	if wasCurr {
 		p.cpus[from].task = nil
+		p.syncQueued(from)
 	}
 	if wake && t.pack != nil {
 		t.pack.quiesce(t, true, max(p.request(t), p.Slice)+p.TickNs)
@@ -280,6 +298,10 @@ func (p *Policy) dispatch(t *Task, cpu int32, preempt bool) {
 		cmd.EnqFlags = p.Enum.EnqPreempt
 		cmd.ExpectCurr = p.io.CurrPid(cpu)
 	}
+	var before uint64
+	if r, ok := p.io.(runSeqIO); ok {
+		before = r.RunSeq(cpu)
+	}
 	if err := p.io.Submit(cmd); err != nil {
 		p.queueRetry(t, cpu)
 		return
@@ -288,6 +310,8 @@ func (p *Policy) dispatch(t *Task, cpu int32, preempt bool) {
 	t.Cpu, t.state = cpu, Dispatched
 	p.cpus[cpu].task = t
 	p.cpus[cpu].protect = t.Req.Deadline
+	p.cpus[cpu].runSeq = before
+	p.syncQueued(cpu)
 }
 
 func (p *Policy) queueRetry(t *Task, cpu int32) {
@@ -331,6 +355,7 @@ func (p *Policy) leave(e Event) {
 	}
 	if p.valid(t.Cpu) && p.cpus[t.Cpu].task == t {
 		p.cpus[t.Cpu].task = nil
+		p.syncQueued(t.Cpu)
 		p.handoff = append(p.handoff, t.Cpu)
 	}
 	t.state = Sleeping
@@ -375,5 +400,29 @@ func (p *Policy) Schedule() {
 		if p.cpus[c].task == nil && p.trees[c].Len() == 0 && p.io.Idle(int32(c)) {
 			p.pull(int32(c))
 		}
+	}
+}
+
+// ReconcileDropped repairs a lost sleep/dequeue event once the BPF CPU table
+// confirms that the task is no longer running and its CPU is idle.
+func (p *Policy) ReconcileDropped() {
+	for c := range p.cpus {
+		cpu := int32(c)
+		t := p.cpus[c].task
+		if t == nil || !p.io.Idle(cpu) || p.io.CurrPid(cpu) != 0 {
+			continue
+		}
+		if r, ok := p.io.(runSeqIO); ok && r.RunSeq(cpu) == p.cpus[c].runSeq {
+			continue
+		}
+		if t.pack != nil {
+			t.pack.quiesce(t, true, max(p.request(t), p.Slice)+p.TickNs)
+			p.recomputeWeights(cpu)
+		}
+		t.Req.Sleep()
+		t.state = Sleeping
+		p.cpus[c].task = nil
+		p.syncQueued(cpu)
+		p.handoff = append(p.handoff, cpu)
 	}
 }

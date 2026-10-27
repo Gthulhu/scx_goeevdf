@@ -11,6 +11,7 @@ type fakeIO struct {
 	n       []uint64
 	idle    []bool
 	allowed map[int32][]int32
+	runSeq  []uint64
 }
 
 func (f *fakeIO) Submit(c Cmd) error {
@@ -26,7 +27,13 @@ func (f *fakeIO) Idle(c int32) bool {
 	}
 	return f.idle[c]
 }
-func (*fakeIO) CurrPid(int32) int32                   { return 0 }
+func (*fakeIO) CurrPid(int32) int32 { return 0 }
+func (f *fakeIO) RunSeq(c int32) uint64 {
+	if f.runSeq == nil {
+		return 0
+	}
+	return f.runSeq[c]
+}
 func (f *fakeIO) SetQueued(c int32, n, _ uint64)      { f.n[c] = n }
 func (f *fakeIO) Affinity(pid int32) ([]int32, error) { return f.allowed[pid], nil }
 
@@ -163,5 +170,68 @@ func TestIdlePullPrefersEligibleDeadline(t *testing.T) {
 	p.pull(1)
 	if got := io.cmds[len(io.cmds)-1].Pid; got != 3 {
 		t.Fatalf("idle pull chose pid %d, want earliest eligible deadline 3", got)
+	}
+}
+
+func TestQuotaForcesSliceReturnWithoutCompetitors(t *testing.T) {
+	io := &fakeIO{n: make([]uint64, 1)}
+	p := New(io, 1, Enums{})
+	if err := p.SetCgroup(7, 0, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := p.SetCPUQuota(7, 1_000_000, 10_000_000); err != nil {
+		t.Fatal(err)
+	}
+	p.Handle(Event{Kind: EvEnqueue, Pid: 1, Cpu: 0, Cgid: 7, Weight: 100, EnqSeq: 1})
+	if len(io.cmds) != 1 || io.cmds[0].Slice > 1_000_000 || io.n[0] == 0 {
+		t.Fatalf("quota task escaped slice accounting: cmds=%v, ctl=%v", io.cmds, io.n)
+	}
+	if err := p.SetCPUQuota(7, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if io.n[0] != 0 {
+		t.Fatalf("unlimited task still forces slice return: %v", io.n)
+	}
+}
+
+func TestIdlePullReservesDestinationQuota(t *testing.T) {
+	io := &fakeIO{n: make([]uint64, 2), allowed: map[int32][]int32{
+		1: {0, 1}, 2: {0, 1},
+	}}
+	p := New(io, 2, Enums{})
+	if err := p.SetCgroup(7, 0, 100); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := p.SetCPUQuota(7, 2_000_000, 10_000_000); err != nil {
+		t.Fatal(err)
+	}
+	p.Handle(Event{Kind: EvEnqueue, Pid: 1, Cpu: 0, Cgid: 7, Weight: 100, EnqSeq: 1})
+	p.Handle(Event{Kind: EvEnqueue, Pid: 2, Cpu: 0, Cgid: 7, Weight: 100, EnqSeq: 1})
+	bw := p.groups[7].bw
+	srcBudget := bw.local[0]
+	p.pull(1)
+	if bw.local[0] != srcBudget || bw.local[1] == 0 || p.tasks[2].Cpu != 1 {
+		t.Fatalf("idle pull charged wrong CPU: local=%v, cpu=%d", bw.local, p.tasks[2].Cpu)
+	}
+}
+
+func TestDroppedSleepEventReconcilesIdleCPU(t *testing.T) {
+	io := &fakeIO{n: make([]uint64, 1), idle: []bool{false}, runSeq: []uint64{0}}
+	p := New(io, 1, Enums{})
+	p.Handle(Event{Kind: EvEnqueue, Pid: 1, Cpu: 0, Weight: 100, EnqSeq: 1})
+	p.Schedule()
+	p.Handle(Event{Kind: EvEnqueue, Pid: 2, Cpu: 0, Weight: 100, EnqSeq: 1})
+	p.ReconcileDropped()
+	if p.cpus[0].task == nil {
+		t.Fatal("cleared current before it ever ran")
+	}
+	io.runSeq[0]++
+	io.idle[0] = true // BPF stopping/idle ran, but EV_SLEEP was lost.
+	p.ReconcileDropped()
+	p.Schedule()
+	if p.cpus[0].task != p.tasks[2] || p.tasks[1].pack != nil {
+		t.Fatal("lost sleep stranded the queued task")
 	}
 }
