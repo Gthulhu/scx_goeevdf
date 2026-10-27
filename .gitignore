@@ -1,0 +1,5 @@
+/bpf/vmlinux.h
+/bpf/goeevdf.bpf.o
+/internal/bpf/*.skel.h
+/goeevdf
+/bin/goeevdf
