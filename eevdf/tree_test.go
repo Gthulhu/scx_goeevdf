@@ -75,6 +75,7 @@ func TestTreeAgainstSortedScan(t *testing.T) {
 				Req:      Request{Deadline: base + uint64(rng.IntN(1000)), Slice: uint64(rng.IntN(100) + 1)},
 				seq:      uint64(step),
 			}
+
 			tr.Insert(task)
 			active[task] = true
 		} else {
@@ -132,5 +133,31 @@ func TestTreeAgainstSortedScan(t *testing.T) {
 		if got := tr.firstN(limit, func(t *Task) bool { return t.Req.Slice%7 == 0 }); got != first {
 			t.Fatalf("step %d: firstN got %p want %p", step, got, first)
 		}
+	}
+}
+
+func TestTreeReusesDetachedNodes(t *testing.T) {
+	var tr Tree
+	task := &Task{Weight: Nice0Weight, Req: Request{Deadline: 100, Slice: 10}}
+	tr.Insert(task)
+	tr.Remove(task)
+	if allocs := testing.AllocsPerRun(1000, func() {
+		tr.Insert(task)
+		tr.Remove(task)
+	}); allocs != 0 {
+		t.Fatalf("steady-state insert/remove allocations = %g", allocs)
+	}
+}
+
+func BenchmarkTreeReinsert(b *testing.B) {
+	var tr Tree
+	task := &Task{Weight: Nice0Weight, Req: Request{Deadline: 100, Slice: 10}}
+	tr.Insert(task)
+	tr.Remove(task)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tr.Insert(task)
+		tr.Remove(task)
 	}
 }

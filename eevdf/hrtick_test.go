@@ -74,3 +74,17 @@ func TestHrtickUsesElapsedRunningTime(t *testing.T) {
 		t.Fatal("queued dispatch cannot arm old run sequence")
 	}
 }
+
+func TestHrtickDoesNotSubtractAccountedService(t *testing.T) {
+	io := &hrtickIO{fakeIO: fakeIO{n: make([]uint64, 1), runSeq: []uint64{5}},
+		curr: 1, start: 1000}
+	p := New(io, 1, Enums{})
+	p.cpus[0].task = &Task{Pid: 1, Weight: Nice0Weight, Vruntime: 30_000,
+		Req: Request{Deadline: 80_000}}
+	p.cpus[0].since = 31_000
+	p.trees[0].Insert(&Task{Req: Request{Deadline: 90_000}})
+	p.hr.start(0, 40_000)
+	if len(io.cmds) != 1 || io.cmds[0].Slice != 81_000 {
+		t.Fatalf("timer subtracted already-accounted service: %+v", io.cmds)
+	}
+}

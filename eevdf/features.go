@@ -35,5 +35,22 @@ func (f *Features) Normalize() {
 }
 
 func (p *Policy) placeTask(t *Task, cpu int32, sleep bool) {
-	p.packs[cpu].placeWith(t, sleep, p.F.PlaceLag, p.F.PlaceRelDeadline)
+	pk := p.packs[cpu]
+	if t.pack == pk {
+		return
+	}
+	var lag int64
+	if p.F.PlaceLag {
+		ref := uint64(0)
+		if t.delay.pack != nil {
+			ref = p.refAt(t.delay.pack, p.now)
+		}
+		lag = pk.settleAt(t, ref)
+		if t.pack != nil {
+			lag = Lag(p.refAt(t.pack, p.now), t.Vruntime, LagLimit(max(t.Req.Slice, 1), t.Weight))
+		}
+	} else {
+		t.delay = delayRec{}
+	}
+	pk.placeWithLag(t, sleep, p.F.PlaceRelDeadline, p.refBeforeJoin(pk, t.Weight, p.now), lag)
 }

@@ -212,3 +212,189 @@ func TestReweightPreservesWeightedLag(t *testing.T) {
 		})
 	}
 }
+
+func TestCgroupIdleWeightAndHierarchy(t *testing.T) {
+	p := New(&fakeIO{n: make([]uint64, 1)}, 1, Enums{})
+	for _, cfg := range [][3]uint64{{1, 0, 100}, {2, 1, 100}, {3, 0, 100}} {
+		if err := p.SetCgroup(cfg[0], cfg[1], cfg[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.SetCgroupIdle(99, true); err == nil {
+		t.Fatal("unknown idle group accepted")
+	}
+	for pid, id := range []uint64{1, 2, 3} {
+		p.Handle(Event{Kind: EvEnqueue, Pid: int32(pid + 1), Cpu: 0, Cgid: id, Weight: 100})
+	}
+	if err := p.SetCgroupIdle(1, true); err != nil {
+		t.Fatal(err)
+	}
+	if p.tasks[1].Weight != 2 || p.tasks[2].Weight != 2 || p.tasks[3].Weight != 1024 {
+		t.Fatalf("idle ancestor weights = %d, %d, %d",
+			p.tasks[1].Weight, p.tasks[2].Weight, p.tasks[3].Weight)
+	}
+	if err := p.SetCgroup(1, 0, 200); err != nil {
+		t.Fatal(err)
+	}
+	if !p.groups[1].Idle || p.tasks[1].Weight != 2 {
+		t.Fatal("weight update discarded idle override")
+	}
+	if err := p.SetCgroupIdle(1, false); err != nil {
+		t.Fatal(err)
+	}
+	if p.tasks[1].Weight != 1024 || p.tasks[2].Weight != 1024 {
+		t.Fatal("clearing idle did not restore configured weight")
+	}
+	if err := p.SetCgroupIdle(2, true); err != nil {
+		t.Fatal(err)
+	}
+	if p.tasks[1].Weight != 2042 || p.tasks[2].Weight != 6 {
+		t.Fatalf("idle child weights = %d, %d", p.tasks[1].Weight, p.tasks[2].Weight)
+	}
+}
+
+func TestCgroupRootDoesNotScaleTasksOrChildren(t *testing.T) {
+	p := New(&fakeIO{n: make([]uint64, 1)}, 1, Enums{})
+	if err := p.SetCgroupRoot(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetCgroup(1, 100, 200); err != nil {
+		t.Fatal(err)
+	}
+	for pid, id := range []uint64{100, 100, 1} {
+		weight := uint64(100)
+		if pid == 1 {
+			weight = 200
+		}
+		p.Handle(Event{Kind: EvEnqueue, Pid: int32(pid + 1), Cpu: 0, Cgid: id, Weight: weight})
+	}
+	if p.tasks[1].Weight != 1024 || p.tasks[2].Weight != 2048 || p.tasks[3].Weight != 2048 {
+		t.Fatal("root incorrectly shared a group weight among tasks and children")
+	}
+	if err := p.SetCgroupIdle(100, true); err == nil {
+		t.Fatal("idle root accepted")
+	}
+	if err := p.SetCgroupRoot(200); err == nil {
+		t.Fatal("second root accepted")
+	}
+	if err := p.SetCgroup(100, 1, 100); err == nil {
+		t.Fatal("reparented root accepted")
+	}
+	if err := p.SetCgroup(100, 0, 10000); err != nil {
+		t.Fatal(err)
+	}
+	if p.tasks[1].Weight != 1024 || p.tasks[3].Weight != 2048 {
+		t.Fatal("root weight affected effective weights")
+	}
+	p.RemoveCgroup(100)
+	if p.groups[1].Parent != nil || p.tasks[3].Weight != 2048 {
+		t.Fatal("removing root changed child weight")
+	}
+}
+
+func TestCgroupCrossCPUSharesRefreshRemoteTasks(t *testing.T) {
+	io := &fakeIO{n: make([]uint64, 2), allowed: map[int32][]int32{
+		1: {0}, 2: {1}, 3: {1},
+	}}
+	p := New(io, 2, Enums{})
+	if err := p.SetCgroup(1, 0, 100); err != nil {
+		t.Fatal(err)
+	}
+	check := func(want ...uint64) {
+		t.Helper()
+		for i, w := range want {
+			if got := p.tasks[int32(i+1)].Weight; got != w {
+				t.Fatalf("pid %d weight = %d, want %d", i+1, got, w)
+			}
+		}
+		for _, pk := range p.packs {
+			var sum uint64
+			for _, task := range pk.members {
+				sum += task.Weight
+			}
+			if pk.W != sum {
+				t.Fatalf("CPU %d pack weight = %d, want %d", pk.CPU, pk.W, sum)
+			}
+		}
+	}
+	for pid := int32(1); pid <= 3; pid++ {
+		cpu := int32(1)
+		if pid == 1 {
+			cpu = 0
+		}
+		p.Handle(Event{Kind: EvEnqueue, Pid: pid, Cpu: cpu, Cgid: 1, Weight: 100})
+	}
+	// Total budget is two CPU weights, distributed by queue load rather
+	// than giving each CPU a whole group weight regardless of demand.
+	check(682, 683, 683)
+	if err := p.SetCgroup(1, 0, 200); err != nil {
+		t.Fatal(err)
+	}
+	check(1365, 1365, 1365)
+	if err := p.SetCgroupIdle(1, true); err != nil {
+		t.Fatal(err)
+	}
+	check(2, 2, 2)
+	if err := p.SetCgroupIdle(1, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SetCgroup(1, 0, 100); err != nil {
+		t.Fatal(err)
+	}
+	check(682, 683, 683)
+	if p.groups[1].queues[0].load != 1024 || p.groups[1].queues[1].load != 2048 ||
+		p.groups[1].queues[0].nr != 1 || p.groups[1].queues[1].nr != 2 {
+		t.Fatal("cross-CPU queue accounting incorrect")
+	}
+	p.Handle(Event{Kind: EvSleep, Pid: 3})
+	check(1024, 1024)
+	p.Handle(Event{Kind: EvExit, Pid: 2})
+	check(1024)
+	if p.groups[1].queues[1].nr != 0 || p.groups[1].queues[1].load != 0 {
+		t.Fatal("empty remote queue retained load")
+	}
+}
+
+func TestCgroupCrossCPUChildEntityAccounting(t *testing.T) {
+	io := &fakeIO{n: make([]uint64, 2), allowed: map[int32][]int32{
+		1: {0}, 2: {1}, 3: {1}, 4: {0},
+	}}
+	p := New(io, 2, Enums{})
+	for _, cfg := range [][3]uint64{{1, 0, 100}, {2, 1, 100}} {
+		if err := p.SetCgroup(cfg[0], cfg[1], cfg[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for pid, id := range []uint64{2, 2, 2, 1} {
+		cpu := io.allowed[int32(pid+1)][0]
+		p.Handle(Event{Kind: EvEnqueue, Pid: int32(pid + 1), Cpu: cpu, Cgid: id, Weight: 100})
+	}
+	parent, child := p.groups[1], p.groups[2]
+	for cpu := range parent.queues {
+		wantLoad, wantNr := child.queues[cpu].shares, uint64(1)
+		if cpu == 0 {
+			wantLoad += Nice0Weight
+			wantNr++
+		}
+		if q := parent.queues[cpu]; q.load != wantLoad || q.nr != wantNr {
+			t.Fatalf("CPU %d parent queue = %+v, want load %d nr %d", cpu, q, wantLoad, wantNr)
+		}
+	}
+	if err := p.SetCgroup(2, 1, 200); err != nil {
+		t.Fatal(err)
+	}
+	if parent.queues[0].load != child.queues[0].shares+Nice0Weight ||
+		parent.queues[1].load != child.queues[1].shares {
+		t.Fatal("child share change was not propagated to parent loads")
+	}
+	io.allowed[1] = []int32{1}
+	p.Handle(Event{Kind: EvEnqueue, Pid: 1, Cpu: 1, Cgid: 2, Weight: 100, EnqSeq: 2})
+	if parent.queues[0].nr != 1 || child.queues[0].nr != 0 ||
+		parent.queues[0].load != Nice0Weight {
+		t.Fatal("migration retained old child contribution")
+	}
+	p.RemoveCgroup(2)
+	if parent.queues[1].nr != 0 || parent.queues[1].load != 0 {
+		t.Fatal("removal retained child contribution")
+	}
+}

@@ -14,6 +14,7 @@ type node struct {
 
 type Tree struct {
 	root *node
+	free *node
 	next uint64
 }
 
@@ -116,7 +117,14 @@ func (tr *Tree) Insert(t *Task) {
 		return
 	}
 	tr.next++
-	t.node = &node{t: t, owner: tr, prio: rand.Uint64(), order: tr.next}
+	n := tr.free
+	if n == nil {
+		n = new(node)
+	} else {
+		tr.free = n.right
+	}
+	*n = node{t: t, owner: tr, prio: rand.Uint64(), order: tr.next}
+	t.node = n
 	tr.root = insert(tr.root, t.node)
 }
 
@@ -124,7 +132,10 @@ func (tr *Tree) Remove(t *Task) {
 	if t == nil || t.node == nil || t.node.owner != tr {
 		return
 	}
-	tr.root = remove(tr.root, t.node)
+	n := t.node
+	tr.root = remove(tr.root, n)
+	*n = node{right: tr.free}
+	tr.free = n
 	t.node = nil
 }
 

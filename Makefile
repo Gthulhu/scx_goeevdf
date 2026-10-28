@@ -21,14 +21,19 @@ build: go
 bpf/vmlinux.h: /sys/kernel/btf/vmlinux
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
-bpf/goeevdf.bpf.o: bpf/goeevdf.bpf.c bpf/intf.h bpf/vmlinux.h
-	@if printf '%s\n' '#include "vmlinux.h"' \
+bpf/goeevdf.bpf.o: bpf/goeevdf.bpf.c bpf/intf.h bpf/vmlinux.h Makefile
+	@features=; \
+	if printf '%s\n' '#include "vmlinux.h"' \
 		'int probe(void) { return ((struct sched_ext_ops *)0)->cgroup_set_bandwidth != 0; }' | \
 		$(CLANG) -x c -fsyntax-only -Ibpf - >/dev/null 2>&1; then \
-		$(CLANG) $(BPF_CFLAGS) -DGOEEVDF_HAVE_CGROUP_SET_BANDWIDTH -c $< -o $@; \
-	else \
-		$(CLANG) $(BPF_CFLAGS) -c $< -o $@; \
-	fi
+		features="$$features -DGOEEVDF_HAVE_CGROUP_SET_BANDWIDTH"; \
+	fi; \
+	if printf '%s\n' '#include "vmlinux.h"' \
+		'int probe(void) { return ((struct sched_ext_ops *)0)->cgroup_set_idle != 0; }' | \
+		$(CLANG) -x c -fsyntax-only -Ibpf - >/dev/null 2>&1; then \
+		features="$$features -DGOEEVDF_HAVE_CGROUP_SET_IDLE"; \
+	fi; \
+	$(CLANG) $(BPF_CFLAGS) $$features -c $< -o $@
 
 internal/bpf/goeevdf.skel.h: bpf/goeevdf.bpf.o
 	$(BPFTOOL) gen skeleton $< > $@

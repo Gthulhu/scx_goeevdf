@@ -8,13 +8,15 @@ type Group struct {
 	ID     uint64
 	Parent *Group
 	Weight uint64 // cpu.weight, 1..10000
+	Idle   bool   // cpu.idle; overrides Weight without discarding it
 	queues []Queue
 	bw     *bwGroup
+	root   bool
 }
 
 // Queue represents a group's runnable load on one CPU.
 type Queue struct {
-	load, shares uint64
+	load, nr, shares uint64
 }
 
 // SetCgroup configures cpu.weight and ancestry. Parents must be configured
@@ -36,13 +38,56 @@ func (p *Policy) SetCgroup(id, parentID, weight uint64) error {
 		}
 	}
 	g := p.groups[id]
+	if g != nil && g.root && parent != nil {
+		return fmt.Errorf("cannot reparent root cgroup")
+	}
 	if g == nil {
 		g = &Group{ID: id, queues: make([]Queue, len(p.cpus))}
 		p.groups[id] = g
 	}
 	g.Parent, g.Weight = parent, weight
-	for c := range p.cpus {
-		p.recomputeWeights(int32(c))
+	p.recomputeWeights(0)
+	return nil
+}
+
+// SetCgroupRoot registers the actual cgroupfs root, whose tasks retain their
+// nice weights. SetCgroup(id, 0, weight) instead registers a weighted top-level
+// group. The root remains in the ancestry for bandwidth accounting.
+func (p *Policy) SetCgroupRoot(id uint64) error {
+	if id == 0 {
+		return fmt.Errorf("invalid root cgroup id")
+	}
+	for otherID, g := range p.groups {
+		if g.root && otherID != id {
+			return fmt.Errorf("root cgroup already configured")
+		}
+	}
+	g := p.groups[id]
+	if g != nil && g.Parent != nil {
+		return fmt.Errorf("root cgroup has a parent")
+	}
+	if g == nil {
+		g = &Group{ID: id, Weight: 100, queues: make([]Queue, len(p.cpus))}
+		p.groups[id] = g
+	}
+	g.root, g.Idle = true, false
+	p.recomputeWeights(0)
+	return nil
+}
+
+// SetCgroupIdle updates cpu.idle on an already configured group. Idle groups
+// use WEIGHT_IDLEPRIO (3), independently of their configured cpu.weight.
+func (p *Policy) SetCgroupIdle(id uint64, idle bool) error {
+	g := p.groups[id]
+	if g == nil {
+		return fmt.Errorf("cgroup %d not configured", id)
+	}
+	if g.root && idle {
+		return fmt.Errorf("root cgroup cannot be idle")
+	}
+	if g.Idle != idle {
+		g.Idle = idle
+		p.recomputeWeights(0)
 	}
 	return nil
 }
@@ -63,9 +108,7 @@ func (p *Policy) RemoveCgroup(id uint64) {
 			child.Parent = g.Parent
 		}
 	}
-	for c := range p.cpus {
-		p.recomputeWeights(int32(c))
-	}
+	p.recomputeWeights(0)
 	if g.bw != nil {
 		for len(g.bw.backlog) != 0 {
 			t := g.bw.backlog[0]
@@ -83,38 +126,60 @@ func (p *Policy) group(t *Task) *Group {
 	return p.groups[t.Cgid]
 }
 
-func (p *Policy) recomputeWeights(cpu int32) {
-	pk := p.packs[cpu]
-	// Compute each group's queue load from its direct tasks and active child
-	// entities. A child contributes its shares once, not once per task.
+func (p *Policy) recomputeWeights(_ int32) {
+	// Shares depend on every CPU's load, so a local membership change must
+	// also refresh remote tasks. These are instantaneous owner-local loads,
+	// not PELT averages or a cross-owner shared load estimate.
 	for _, g := range p.groups {
-		g.queues[cpu] = Queue{shares: cgroupLoadWeight(g.Weight)}
+		clear(g.queues)
 	}
-	members := make([]*Task, 0, len(pk.members))
-	for _, t := range pk.members {
-		members = append(members, t)
-	}
-	for _, t := range members {
-		if g := p.group(t); g != nil {
-			g.queues[cpu].load += t.Nice
+	members := make([]*Task, 0, len(p.tasks))
+	for cpu, pk := range p.packs {
+		for _, t := range pk.members {
+			members = append(members, t)
+			if g := p.group(t); g != nil && !g.root {
+				g.queues[cpu].load += t.Nice
+				g.queues[cpu].nr++
+			}
 		}
 	}
-	// Bottom-up by ancestry depth; a queue with load contributes one entity
-	// at the parent, regardless of its task count.
-	for depth := len(p.groups); depth > 0; depth-- {
+	// Finish children before parents. Each active child queue contributes
+	// exactly one entity, weighted by its newly computed local shares.
+	maxDepth := 0
+	for _, g := range p.groups {
+		maxDepth = max(maxDepth, groupDepth(g))
+	}
+	for depth := maxDepth; depth > 0; depth-- {
 		for _, g := range p.groups {
-			if g.Parent == nil || groupDepth(g) != depth || g.queues[cpu].load == 0 {
+			if g.root || groupDepth(g) != depth {
 				continue
 			}
-			g.Parent.queues[cpu].load += g.queues[cpu].shares
+			var load, nr uint64
+			for _, q := range g.queues {
+				load += q.load
+				nr += q.nr
+			}
+			weight := cgroupLoadWeight(g.Weight)
+			if g.Idle {
+				weight = 3
+			}
+			for cpu := range g.queues {
+				q := &g.queues[cpu]
+				q.shares = groupShares(weight, nr, uint64(len(p.cpus)),
+					q.load, q.load, load, q.load)
+				if q.nr != 0 && g.Parent != nil && !g.Parent.root {
+					g.Parent.queues[cpu].load += q.shares
+					g.Parent.queues[cpu].nr++
+				}
+			}
 		}
 	}
 	for _, t := range members {
 		w := t.Nice
 		if g := p.group(t); g != nil {
 			fixed := t.Nice << GroupWeightShift
-			for ; g != nil; g = g.Parent {
-				q := g.queues[cpu]
+			for ; g != nil && !g.root; g = g.Parent {
+				q := g.queues[t.pack.CPU]
 				fixed = propWeight(fixed, q.shares, q.load)
 			}
 			w = roundWeight(fixed)

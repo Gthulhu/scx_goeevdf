@@ -3,3 +3,4 @@
 /internal/bpf/*.skel.h
 /goeevdf
 /bin/goeevdf
+/bin/bpf-load.test

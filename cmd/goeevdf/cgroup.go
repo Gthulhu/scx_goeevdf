@@ -20,6 +20,7 @@ type groupSync struct {
 
 type groupConfig struct {
 	parent, weight, quota, period uint64
+	idle                          bool
 }
 
 func cgroupPath(pid int32) (string, error) {
@@ -56,6 +57,25 @@ func readWeight(path string) uint64 {
 		}
 	}
 	return 100
+}
+
+// Missing cpu.idle (including at the cgroupfs root) means non-idle.
+func readIdle(path string) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(path, "cpu.idle"))
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(string(data)) {
+	case "0":
+		return false, nil
+	case "1":
+		return true, nil
+	default:
+		return false, fmt.Errorf("invalid cpu.idle in %s", path)
+	}
 }
 
 func readQuota(path string) (quota, period uint64, err error) {
@@ -97,7 +117,14 @@ func (s *groupSync) configure(p *eevdf.Policy, path string) error {
 			return err
 		}
 	}
-	config := groupConfig{parent: parentID, weight: readWeight(path)}
+	idle, err := readIdle(path)
+	if err != nil {
+		return err
+	}
+	config := groupConfig{parent: parentID, weight: readWeight(path), idle: idle}
+	if path == "/sys/fs/cgroup" {
+		config.idle = false
+	}
 	if quota, period, err := readQuota(path); err == nil {
 		config.quota, config.period = quota, period
 	}
@@ -109,7 +136,15 @@ func (s *groupSync) configure(p *eevdf.Policy, path string) error {
 		s.paths[id] = path
 		return nil
 	}
-	if err := p.SetCgroup(id, parentID, config.weight); err != nil {
+	if path == "/sys/fs/cgroup" {
+		err = p.SetCgroupRoot(id)
+	} else {
+		err = p.SetCgroup(id, parentID, config.weight)
+	}
+	if err != nil {
+		return err
+	}
+	if err := p.SetCgroupIdle(id, config.idle); err != nil {
 		return err
 	}
 	if config.period != 0 && (!known || previous.quota != config.quota || previous.period != config.period) {
@@ -132,34 +167,58 @@ func (s *groupSync) configure(p *eevdf.Policy, path string) error {
 	return nil
 }
 
-func (s *groupSync) refresh(p *eevdf.Policy, id uint64) {
+func (s *groupSync) refresh(p *eevdf.Policy, id uint64) error {
 	path := s.paths[id]
 	if path == "" {
-		return
+		return nil
 	}
-	if actual, err := cgroupID(path); err == nil && actual == id {
-		if s.configure(p, path) == nil {
-			s.last[id] = time.Now()
+	actual, err := cgroupID(path)
+	if os.IsNotExist(err) || (err == nil && actual != id) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := s.configure(p, path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
 		}
+		return err
 	}
+	if s.last == nil {
+		s.last = make(map[uint64]time.Time)
+	}
+	s.last[id] = time.Now()
+	return nil
 }
 
-func (s *groupSync) sync(p *eevdf.Policy, pid int32, id uint64) {
+func (s *groupSync) sync(p *eevdf.Policy, pid int32, id uint64) error {
 	if id == 0 || time.Since(s.last[id]) < time.Second {
-		return
+		return nil
 	}
 	path, err := cgroupPath(pid)
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
-		return
+		return err
 	}
 	got, err := cgroupID(path)
-	if err != nil || got != id {
-		return
+	if os.IsNotExist(err) || (err == nil && got != id) {
+		return nil
 	}
-	if err := s.configure(p, path); err == nil {
-		if s.last == nil {
-			s.last = make(map[uint64]time.Time)
+	if err != nil {
+		return err
+	}
+	if err := s.configure(p, path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
 		}
-		s.last[id] = time.Now()
+		return err
 	}
+	if s.last == nil {
+		s.last = make(map[uint64]time.Time)
+	}
+	s.last[id] = time.Now()
+	return nil
 }

@@ -26,6 +26,7 @@ type Task struct {
 	state   State
 	lastSum uint64
 	backlog *bwGroup
+	wake    wakeState
 }
 
 type State uint8

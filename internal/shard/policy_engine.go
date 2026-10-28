@@ -90,7 +90,16 @@ func (e *PolicyEngine) Configure(c Config) error {
 	p := e.Shard.Policy
 	switch c.Kind {
 	case ConfigGroup:
-		return p.SetCgroup(c.ID, c.Parent, c.Weight)
+		var err error
+		if c.Root {
+			err = p.SetCgroupRoot(c.ID)
+		} else {
+			err = p.SetCgroup(c.ID, c.Parent, c.Weight)
+		}
+		if err != nil {
+			return err
+		}
+		return p.SetCgroupIdle(c.ID, c.Idle)
 	case ConfigQuota:
 		return p.SetCPUQuota(c.ID, c.Quota, c.Period)
 	case ConfigRemoveGroup:

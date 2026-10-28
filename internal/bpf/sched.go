@@ -26,14 +26,15 @@ import (
 // Sched owns the attached scheduler. Close only after all shard loops exit.
 // Each shard must have exactly one ConsumeShard consumer and SubmitShard producer.
 type Sched struct {
-	handle   *C.struct_ge_handle
-	CPU      []CpuSlot // BPF writes; use atomic loads for concurrently changing fields.
-	Ctl      []CpuCtl  // Go writes; use atomic stores.
-	Task     []TaskPub // Go writes; publish multi-field updates with an odd/even Seq.
-	maps     [][]byte
-	bss      []byte
-	cpuShard []uint32
-	nrShards int
+	handle                *C.struct_ge_handle
+	CPU                   []CpuSlot // BPF writes; use atomic loads for concurrently changing fields.
+	Ctl                   []CpuCtl  // Go writes; use atomic stores.
+	Task                  []TaskPub // Go writes; publish multi-field updates with an odd/even Seq.
+	maps                  [][]byte
+	bss                   []byte
+	cpuShard              []uint32
+	nrShards              int
+	kickIdle, kickPreempt uint64
 }
 
 // Open loads the default object path; GOEEVDF_BPF_OBJECT can override it.
@@ -55,9 +56,21 @@ func OpenPath(path string) (*Sched, error) {
 	return &Sched{handle: h, nrShards: 1}, nil
 }
 
+func (s *Sched) SetKickFlags(idle, preempt uint64) {
+	s.kickIdle, s.kickPreempt = idle, preempt
+}
+
 // SetUserschedTgid must precede Load; it exempts the Go process from external dispatch.
 func (s *Sched) SetUserschedTgid(tgid uint32) error {
 	return check(C.ge_set_tgid(s.handle, C.uint32_t(tgid)))
+}
+
+// SetUserschedCPUs configures heartbeat wakeup targets before Load.
+func (s *Sched) SetUserschedCPUs(cpus []uint32) error {
+	if len(cpus) == 0 || len(cpus) > MaxShards {
+		return syscall.EINVAL
+	}
+	return check(C.ge_set_usersched_cpus(s.handle, (*C.uint32_t)(unsafe.Pointer(&cpus[0])), C.uint32_t(len(cpus))))
 }
 
 // SetShards configures CPU-to-shard ownership before Load. Unspecified CPUs
@@ -198,17 +211,34 @@ func (s *Sched) SubmitShard(id int, c *Cmd) error {
 	if c.Kind == CmdHrtick {
 		return check(C.ge_hrtick(s.handle, C.int32_t(c.Cpu), C.uint32_t(c.Slot), C.uint64_t(c.Slice)))
 	}
+	if s.kickIdle == 0 || s.kickPreempt == 0 {
+		enums, err := ImportEnums()
+		if err != nil {
+			return err
+		}
+		s.SetKickFlags(enums.KickIdle, enums.KickPreempt)
+	}
 	code := C.ge_submit_shard(s.handle, C.uint32_t(id), (*C.struct_cmd)(unsafe.Pointer(c)))
 	runtime.KeepAlive(s)
 	if err := check(code); err != nil {
 		return err
 	}
-	flags := uint64(1) // SCX_KICK_IDLE
+	flags := s.kickIdle
 	if c.Kind == CmdStop || (c.Kind == CmdDispatch && c.EnqFlags != 0) {
-		flags = 2 // SCX_KICK_PREEMPT
+		flags = s.kickPreempt
 	}
-	_ = s.Kick(c.Cpu, flags)
+	if err := s.Kick(c.Cpu, flags); err != nil {
+		fmt.Fprintf(os.Stderr, "goeevdf: command queued but kick of CPU %d failed: %v\n", c.Cpu, err)
+	}
 	return nil
+}
+
+// KickIdle wakes a target using the kernel-imported flag.
+func (s *Sched) KickIdle(cpu int32) error {
+	if s.kickIdle == 0 {
+		return errors.New("kernel kick flags have not been configured")
+	}
+	return s.Kick(cpu, s.kickIdle)
 }
 
 // Kick executes a BPF syscall program to force a target CPU's dispatch callback.

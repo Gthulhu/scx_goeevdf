@@ -33,15 +33,11 @@ func (h *Hrtick) start(c int32, now uint64) {
 		return
 	}
 	in := uint64(remaining) * cur.Weight / Nice0Weight
-	if start, ok := p.io.(runStartIO); ok {
-		if since := start.RunStart(c); since != 0 && now >= since {
-			elapsed := now - since
-			if elapsed >= in {
-				return
-			}
-			in -= elapsed
-		}
+	_, elapsed := p.uncharged(c, now)
+	if elapsed >= in {
+		return
 	}
+	in -= elapsed
 	if in < hrtickMinNs {
 		return
 	}

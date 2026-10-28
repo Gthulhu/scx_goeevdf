@@ -20,6 +20,37 @@ struct ge_handle {
 	uint32_t cpu_shards[MAX_CPUS], nr_shards;
 };
 
+int ge_enum_value(const char *name, uint64_t *value)
+{
+	struct btf *btf = btf__load_vmlinux_btf();
+	int err = -ENOENT;
+
+	if (libbpf_get_error(btf))
+		return libbpf_get_error(btf);
+	for (uint32_t id = 1; id < btf__type_cnt(btf); id++) {
+		const struct btf_type *t = btf__type_by_id(btf, id);
+
+		if (!btf_is_enum(t) && !btf_is_enum64(t))
+			continue;
+		for (int i = 0; i < btf_vlen(t); i++) {
+			uint32_t off = btf_is_enum(t) ? btf_enum(t)[i].name_off :
+				btf_enum64(t)[i].name_off;
+			if (strcmp(btf__name_by_offset(btf, off), name))
+				continue;
+			if (btf_is_enum(t))
+				*value = btf_kflag(t) ? (uint64_t)(int64_t)btf_enum(t)[i].val :
+					(uint32_t)btf_enum(t)[i].val;
+			else
+				*value = btf_enum64_value(&btf_enum64(t)[i]);
+			err = 0;
+			goto out;
+		}
+	}
+out:
+	btf__free(btf);
+	return err;
+}
+
 static struct bpf_map *find_map(struct ge_handle *h, const char *name)
 {
 	struct bpf_map *map;
@@ -99,6 +130,7 @@ static int disable_missing_ops(struct ge_handle *h)
 		{ "core_sched_before", "ge_core_sched_before" },
 		{ "dump_task", "ge_dump_task" },
 		{ "cgroup_set_bandwidth", "ge_cgroup_set_bandwidth" },
+		{ "cgroup_set_idle", "ge_cgroup_set_idle" },
 	};
 	struct btf *kernel = btf__load_vmlinux_btf();
 	int kernel_id, i, err = 0;
@@ -168,6 +200,19 @@ static int set_rodata(struct ge_handle *h, const char *name, const void *value, 
 int ge_set_tgid(struct ge_handle *h, uint32_t tgid)
 {
 	return set_rodata(h, "usersched_tgid", &tgid, sizeof(tgid));
+}
+
+int ge_set_usersched_cpus(struct ge_handle *h, const uint32_t *cpus, uint32_t nr)
+{
+	uint32_t mapping[MAX_SHARDS] = {};
+	if (!cpus || !nr || nr > MAX_SHARDS)
+		return -EINVAL;
+	for (uint32_t i = 0; i < nr; i++) {
+		if (cpus[i] >= MAX_CPUS)
+			return -EINVAL;
+		mapping[i] = cpus[i];
+	}
+	return set_rodata(h, "usersched_cpus", mapping, sizeof(mapping));
 }
 
 int ge_set_shards(struct ge_handle *h, const uint32_t *cpus, uint32_t len, uint32_t nr)

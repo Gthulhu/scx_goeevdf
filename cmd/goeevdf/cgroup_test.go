@@ -25,11 +25,30 @@ func TestReadQuota(t *testing.T) {
 		if err := os.WriteFile(path, []byte(tc.text), 0600); err != nil {
 			t.Fatal(err)
 		}
-
 		quota, period, err := readQuota(dir)
 		if (err != nil) != tc.wantErr || (!tc.wantErr &&
 			(quota != tc.quota || period != tc.period)) {
 			t.Fatalf("readQuota(%q) = %d, %d, %v", tc.text, quota, period, err)
+		}
+	}
+}
+
+func TestReadIdle(t *testing.T) {
+	dir := t.TempDir()
+	if idle, err := readIdle(dir); err != nil || idle {
+		t.Fatalf("missing cpu.idle: idle=%v error=%v", idle, err)
+	}
+	for _, tc := range []struct {
+		text    string
+		want    bool
+		wantErr bool
+	}{{"0\n", false, false}, {"1\n", true, false}, {" 1 \n", true, false},
+		{"2\n", false, true}, {"invalid\n", false, true}, {"", false, true}} {
+		if err := os.WriteFile(filepath.Join(dir, "cpu.idle"), []byte(tc.text), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := readIdle(dir); got != tc.want || (err != nil) != tc.wantErr {
+			t.Errorf("readIdle(%q) = %v, %v; want %v, error=%v", tc.text, got, err, tc.want, tc.wantErr)
 		}
 	}
 }
@@ -48,6 +67,12 @@ func TestConfigureRootCgroup(t *testing.T) {
 	config, ok := groups.applied[id]
 	if !ok || config.parent != 0 {
 		t.Fatalf("root cgroup not configured: %+v", groups.applied)
+	}
+	if config.idle {
+		t.Fatal("root cgroup configured as idle")
+	}
+	if err := p.SetCgroupIdle(id, true); err == nil {
+		t.Fatal("cgroupfs root was registered as a weighted group")
 	}
 	if quota, period, err := readQuota(root); err == nil &&
 		(config.quota != quota || config.period != period) {

@@ -46,13 +46,15 @@ type IO interface {
 }
 
 type Enums struct {
-	EnqWakeup, EnqPreempt, EnqBlocked uint64
+	EnqWakeup, EnqPreempt, EnqBlocked            uint64
+	WakeSync, WakeFork, WakeCurrentCPU, WakeTTWU uint64
 }
 
 type cpuState struct {
 	task    *Task
 	protect uint64
 	runSeq  uint64
+	since   uint64
 }
 
 type runSeqIO interface {
@@ -180,6 +182,10 @@ func (p *Policy) Handle(e Event) {
 	}
 	defer func() {
 		if t := p.tasks[e.Pid]; t != nil {
+			if (e.Kind == EvKeep || e.Kind == EvYield || e.Kind == EvEnqueue) &&
+				p.valid(t.Cpu) && p.cpus[t.Cpu].task == t {
+				p.cpus[t.Cpu].since = p.now
+			}
 			p.pub.PublishTask(p, t, p.now)
 		}
 	}()
@@ -378,7 +384,16 @@ func (p *Policy) dispatch(t *Task, cpu int32, preempt bool) {
 	t.Cpu, t.state = cpu, Dispatched
 	p.cpus[cpu].task = t
 	p.cpus[cpu].protect = t.Req.Deadline
+	if !p.F.RunToParity {
+		p.cpus[cpu].protect = t.Vruntime
+	} else if slice := p.trees[cpu].MinSlice(); slice != 0 && slice < p.request(t) {
+		limit := t.Vruntime + slice*Nice0Weight/max(t.Weight, 1)
+		if TimeBefore(limit, p.cpus[cpu].protect) {
+			p.cpus[cpu].protect = limit
+		}
+	}
 	p.cpus[cpu].runSeq = before
+	p.cpus[cpu].since = p.now
 	p.nb.idleEnded(cpu, p.now)
 	p.ld.taskRunning(t, true, p.now)
 	p.ld.cpuRunning(cpu, true, p.now)
@@ -399,7 +414,7 @@ func (p *Policy) queueRetry(t *Task, cpu int32) {
 func (p *Policy) pick(cpu int32) *Task {
 	pk := p.packs[cpu]
 	if p.F.Eligibility && p.F.EligibleScan {
-		if t := p.trees[cpu].PickEligible(pk.Ref); t != nil {
+		if t := p.trees[cpu].PickEligible(p.refAt(pk, p.now)); t != nil {
 			return t
 		}
 	}
@@ -407,7 +422,7 @@ func (p *Policy) pick(cpu int32) *Task {
 }
 
 func (p *Policy) keepRunning(t *Task, cpu int32) bool {
-	if p.F.Eligibility && TimeBefore(p.packs[cpu].Ref, t.Vruntime) {
+	if p.F.Eligibility && TimeBefore(p.refAt(p.packs[cpu], p.now), t.Vruntime) {
 		return false
 	}
 	head := p.pick(cpu)

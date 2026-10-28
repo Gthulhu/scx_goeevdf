@@ -5,15 +5,17 @@ serialized per-shard policy callbacks, deterministic mailbox stepping, asynchron
 steal requests, copy-on-publish CPU snapshots, and explicit task handoff.
 `NewPolicyEngine` creates one independent `eevdf.Policy` for each shard and
 exports/imports queued or sleeping tasks (excluding proxy-blocked tasks),
-preserving requests, lag and task utilization history. **It does not implement BPF per-shard rings or scheduler
-threads. Do not enable multi-shard scheduling with the unmodified `eevdf.Policy`
-or a single shared BPF command ring.** A request to transfer a still-running
+preserving requests, lag, wake history and task utilization history.
+The BPF per-shard rings and scheduler threads are wired by
+[`cmd/goeevdf/sharded.go`](../../cmd/goeevdf/sharded.go), not by this package.
+Do not use a single shared BPF command ring for multiple policy owners.
+A request to transfer a still-running
 task retains source ownership without terminating the owner loop. A later
 remote kernel enqueue is handled by the source with redispatch suppressed,
-then its pending state is exported to the destination. Active cross-shard `StopFor` currently
-returns `ErrActiveStopUnsupported` synchronously, without submitting a STOP
-command or moving a running task. A future implementation needs a verified
-kernel stop/reenqueue event before source export. cpu.max budgets can use a
+then its pending state is exported to the destination. Active cross-shard
+`StopFor` uses the policy engine's stop/reenqueue acknowledgement before source
+export; custom engines without that support reject it synchronously.
+cpu.max budgets can use a
 bound shared pool; group-wide load aggregates are not yet shared across shard
 policies.
 
@@ -47,8 +49,9 @@ Integration:
    `eevdf.SharedQuotaPool` and use `NewPolicyEngineWithQuota` for **every**
    engine; `BroadcastConfig(ConfigQuota)` rejects finite quotas unless all
    engines report a shared pool. Call `pool.Configure(id,quota,period)` once
-   before broadcasting a changed quota, and `pool.Refill(now)` from shard 0
-   only.
+   before broadcasting an initial quota, and `pool.Refill(now)` from shard 0
+   only. The runtime rejects dynamic finite quota updates: safely reconciling
+   already-reserved slices across all owners is not yet implemented.
 3. Convert each BPF task event to `eevdf.Event` and call `Route(bpfSlot, event)`.
    **The first kernel enqueue has slot zero:** the coordinator registers
    provisional ownership by PID and allocates a unique canonical publication
@@ -94,5 +97,6 @@ restoration also fails, the task remains in transit and restoration is retried
 until the integration fixes the engine error. Neither engine may mutate an
 in-transit task. Go tests cover deterministic mappings and handoffs, rollback,
 foreign command rejection, concurrent routing with `-race`, and one million
-completed transfers. Kernel-level tests and per-shard ring integration remain
-separate work.
+completed transfers. Privileged load/ring tests exist, but multi-shard workloads
+and the full kernel acceptance matrix remain separate work; see
+[`ALIGNMENT.md`](../../ALIGNMENT.md).

@@ -8,6 +8,7 @@
 
 void scx_bpf_dsq_insert(struct task_struct *, u64, u64, u64) __ksym;
 bool scx_bpf_dsq_move_to_local(u64) __ksym;
+s32 scx_bpf_dsq_nr_queued(u64) __ksym;
 s32 scx_bpf_create_dsq(u64, s32) __ksym;
 void scx_bpf_kick_cpu(s32, u64) __ksym;
 s32 scx_bpf_task_cpu(const struct task_struct *) __ksym;
@@ -76,8 +77,34 @@ const volatile u32 usersched_tgid;
 const volatile u64 usersched_slice = 1000000;
 const volatile u32 cpu_shard[MAX_CPUS];
 const volatile u32 nr_shards = 1;
+const volatile u32 usersched_cpus[MAX_SHARDS];
 volatile u64 nr_queued, nr_scheduled, nr_ev_drops, nr_congested, nr_stale_cmds, nr_bounces;
 volatile u64 nr_queued_s[MAX_SHARDS], nr_scheduled_s[MAX_SHARDS], needed_s[MAX_SHARDS];
+volatile u64 exit_kind, exit_code, heartbeat_ticks;
+
+struct heartbeat {
+	struct bpf_timer timer;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct heartbeat);
+	__uint(max_entries, 1);
+} heartbeat SEC(".maps");
+
+static int heartbeat_fire(void *map, int *key, struct heartbeat *h)
+{
+	__sync_fetch_and_add(&heartbeat_ticks, 1);
+	for (u32 shard = 0; shard < MAX_SHARDS; shard++) {
+		if (shard >= nr_shards)
+			break;
+		needed_s[shard] = 1;
+		if (usersched_cpus[shard] < MAX_CPUS)
+			scx_bpf_kick_cpu(usersched_cpus[shard], SCX_KICK_IDLE);
+	}
+	bpf_timer_start(&h->timer, 1000000, 0);
+	return 0;
+}
 
 static __always_inline u32 shard_for_cpu(s32 cpu)
 {
@@ -324,6 +351,10 @@ void BPF_STRUCT_OPS(ge_dispatch, s32 cpu, struct task_struct *prev)
 	/* A runnable userspace scheduler must be able to handle signals and
 	 * recover from missed events even when the counters read as zero. */
 	if (scx_bpf_dsq_move_to_local(SCHED_DSQ_BASE + shard))
+		return;
+	/* Drained commands may already have populated the local DSQ even when
+	 * Go's eligible tree (ctl->nr_queued) has become empty. */
+	if (scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL))
 		return;
 	if (!prev || prev->tgid == usersched_tgid ||
 	    !(BPF_CORE_READ(prev, scx.flags) & SCX_TASK_QUEUED))
@@ -591,6 +622,17 @@ void BPF_STRUCT_OPS(ge_cgroup_set_weight, struct cgroup *cg, u32 weight)
 		bpf_ringbuf_submit(e, 0);
 	}
 }
+#ifdef GOEEVDF_HAVE_CGROUP_SET_IDLE
+void BPF_STRUCT_OPS(ge_cgroup_set_idle, struct cgroup *cg, bool idle)
+{
+	struct ev *e = ev_reserve(EV_CGRP_IDLE, -1);
+	if (e) {
+		e->cgid = cgroup_id(cg);
+		e->arg[0] = idle;
+		bpf_ringbuf_submit(e, 0);
+	}
+}
+#endif
 #ifdef GOEEVDF_HAVE_CGROUP_SET_BANDWIDTH
 void BPF_STRUCT_OPS(ge_cgroup_set_bandwidth, struct cgroup *cg, u64 period, u64 quota, u64 burst)
 {
@@ -627,6 +669,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ge_init)
 {
 	int ret;
 	u32 nr = scx_bpf_nr_cpu_ids();
+	u32 zero = 0;
+	struct heartbeat *h;
 	int err = 0;
 
 	if (!nr_shards || nr_shards > MAX_SHARDS)
@@ -645,7 +689,21 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(ge_init)
 		return ret;
 	if (err)
 		return err;
-	return 0;
+	h = bpf_map_lookup_elem(&heartbeat, &zero);
+	if (!h)
+		return -12;
+	ret = bpf_timer_init(&h->timer, &heartbeat, CLOCK_MONOTONIC);
+	if (ret)
+		return ret;
+	ret = bpf_timer_set_callback(&h->timer, heartbeat_fire);
+	if (ret)
+		return ret;
+	return bpf_timer_start(&h->timer, 1000000, 0);
+}
+void BPF_STRUCT_OPS(ge_exit, struct scx_exit_info *info)
+{
+	exit_code = info->exit_code;
+	exit_kind = info->kind;
 }
 struct kick_arg { s32 cpu; u32 pad; u64 flags; };
 struct hrtick_arg { s32 cpu; u32 run_seq; u64 when; };
@@ -697,10 +755,16 @@ struct sched_ext_ops ge_ops = {
 	.cgroup_exit = (void *)ge_cgroup_exit,
 	.cgroup_move = (void *)ge_cgroup_move,
 	.cgroup_set_weight = (void *)ge_cgroup_set_weight,
+#ifdef GOEEVDF_HAVE_CGROUP_SET_IDLE
+	.cgroup_set_idle = (void *)ge_cgroup_set_idle,
+#endif
 #ifdef GOEEVDF_HAVE_CGROUP_SET_BANDWIDTH
 	.cgroup_set_bandwidth = (void *)ge_cgroup_set_bandwidth,
 #endif
 	.init = (void *)ge_init,
+	.exit = (void *)ge_exit,
+	.flags = SCX_OPS_ENQ_LAST | SCX_OPS_KEEP_BUILTIN_IDLE | SCX_OPS_HAS_CGROUP_WEIGHT,
+	.timeout_ms = 5000,
 	.name = "goeevdf",
 };
 char LICENSE[] SEC("license") = "GPL";

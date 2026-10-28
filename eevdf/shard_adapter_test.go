@@ -33,6 +33,7 @@ func TestShardPendingImageAndLag(t *testing.T) {
 	orig.Vruntime = 1234567
 	orig.Req = Request{Deadline: 1239999, Slice: 10_000, Weight: orig.Weight}
 	orig.lastSum = 123
+	orig.wake = wakeState{flips: 7, decayAt: 123000, lastWakee: 91}
 	originalLag := src.Policy.packs[0].lag(orig, src.Policy.Slice+src.Policy.TickNs)
 	image, err := src.Export(42, 17)
 	if err != nil {
@@ -57,6 +58,9 @@ func TestShardPendingImageAndLag(t *testing.T) {
 	}
 	if imported.Req.Slice != 10_000 || imported.Req.Weight != Nice0Weight {
 		t.Fatalf("request lost in transit: %+v", imported.Req)
+	}
+	if imported.wake != orig.wake {
+		t.Fatalf("wake history lost in transit: %+v != %+v", imported.wake, orig.wake)
 	}
 	if err := dst.Import(42, 17, 8, image); err == nil {
 		t.Fatal("duplicate import succeeded")

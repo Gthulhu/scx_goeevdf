@@ -19,6 +19,7 @@ type Config struct {
 	Kind               ConfigKind
 	ID, Parent, Weight uint64
 	Quota, Period      uint64
+	Idle, Root         bool
 }
 
 func (c Config) validate() error {
@@ -29,6 +30,9 @@ func (c Config) validate() error {
 	case ConfigGroup:
 		if c.ID == c.Parent || c.Weight < 1 || c.Weight > 10000 {
 			return fmt.Errorf("invalid cgroup parent or weight")
+		}
+		if c.Root && (c.Parent != 0 || c.Idle) {
+			return fmt.Errorf("root cgroup cannot have a parent or be idle")
 		}
 	case ConfigQuota:
 		if c.Quota != 0 && c.Period == 0 {

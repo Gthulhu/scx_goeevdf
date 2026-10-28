@@ -134,6 +134,10 @@ func updateFrequency(p *eevdf.Policy, gov *eevdf.FrequencyGovernor, io perfIO, n
 }
 
 func run(ctx context.Context, object string, features eevdf.Features) error {
+	enums, features, err := runtimeEnums(features)
+	if err != nil {
+		return err
+	}
 	ncpu, err := possibleCPUs()
 	if err != nil {
 		return err
@@ -145,17 +149,30 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 		return err
 	}
 	defer s.Close()
+	s.SetKickFlags(enums.KickIdle, enums.KickPreempt)
 	if err := s.SetUserschedTgid(uint32(os.Getpid())); err != nil {
+		return err
+	}
+	allowed, err := ioAffinity()
+	if err != nil {
+		return err
+	}
+	if err := s.SetUserschedCPUs([]uint32{uint32(allowed[0])}); err != nil {
 		return err
 	}
 	if err := s.Load(); err != nil {
 		return err
 	}
+	tid, _, errno := syscall.RawSyscall(syscall.SYS_GETTID, 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	if err := s.RegisterUsersched(uint32(tid), 0); err != nil {
+		return err
+	}
 	pressure := eevdf.NewPressure(ncpu)
 	io := backend{sched: s, pressure: pressure}
-	p := eevdf.New(io, ncpu, eevdf.Enums{
-		EnqWakeup: 1, EnqPreempt: 1 << 32,
-	})
+	p := eevdf.New(io, ncpu, policyEnums(enums))
 	p.F = features
 	p.F.Normalize()
 	if err := p.SetTopology(readTopology("/sys/devices/system/cpu", ncpu)); err != nil {
@@ -170,6 +187,7 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 	nextTick := clockNow()
 	nextPressure := nextTick
 	drops := s.Counter("nr_ev_drops")
+	var gc taskGC
 	recoverUntil := uint64(0)
 	for ctx.Err() == nil {
 		count := 0
@@ -183,16 +201,21 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 			if !ok {
 				break
 			}
+			gc.observe(ev)
 			if ev.Kind == eevdf.EvEnqueue {
 				s.DecNrQueued(1)
-				groups.sync(p, ev.Pid, ev.Cgid)
+				if err := groups.sync(p, ev.Pid, ev.Cgid); err != nil {
+					return fmt.Errorf("enqueue cgroup %d: %w", ev.Cgid, err)
+				}
 			} else if ev.Kind == bpf.EvCgrpExit {
 				p.RemoveCgroup(ev.Cgid)
 				delete(groups.last, ev.Cgid)
 				delete(groups.applied, ev.Cgid)
 				delete(groups.paths, ev.Cgid)
-			} else if ev.Kind == bpf.EvCgrpWeight || ev.Kind == bpf.EvCgrpBW {
-				groups.refresh(p, ev.Cgid)
+			} else if ev.Kind == bpf.EvCgrpWeight || ev.Kind == bpf.EvCgrpIdle || ev.Kind == bpf.EvCgrpBW {
+				if err := groups.refresh(p, ev.Cgid); err != nil {
+					return fmt.Errorf("refresh cgroup %d: %w", ev.Cgid, err)
+				}
 			}
 			p.Handle(eevdf.Event{
 				Kind: ev.Kind, Pid: ev.Pid, Tgid: ev.Tgid, Cpu: ev.Cpu,
@@ -213,6 +236,18 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 			updateFrequency(p, governor, io, clockNow(), ncpu, attached)
 		}
 		if now := clockNow(); now >= nextTick {
+			if kind := s.Counter("exit_kind"); kind != 0 {
+				return fmt.Errorf("kernel scheduler exited: kind=%d code=%d", kind, int64(s.Counter("exit_code")))
+			}
+			if err := gc.collect(now, s.Counter("nr_ev_drops"),
+				func(pid int32) error { return syscall.Kill(int(pid), 0) },
+				func(ev bpf.Ev) error {
+					p.Handle(eevdf.Event{Kind: eevdf.EvExit, Pid: ev.Pid,
+						Cpu: ev.Cpu, SumExec: ev.SumExec, Now: ev.Now})
+					return nil
+				}); err != nil {
+				return err
+			}
 			p.Periodic(now)
 			p.BalanceTick(now)
 			updateFrequency(p, governor, io, now, ncpu, nil)
@@ -267,6 +302,9 @@ func main() {
 	noDelayRequeue := flag.Bool("no-delay-requeue", false, "disable deferred requeue")
 	noProxyExec := flag.Bool("no-proxy-exec", false, "disable blocked donor handling")
 	noHrtick := flag.Bool("no-hrtick", false, "disable hrtick preemption")
+	noVrefUpdate := flag.Bool("no-vref-update", false, "disable running-task reference-time projection")
+	noWakeSync := flag.Bool("no-wake-sync", false, "disable synchronous wake-affine placement")
+	noWaWeight := flag.Bool("no-wa-weight", false, "disable weighted wake-affine placement")
 	noSISUtil := flag.Bool("no-sis-util", false, "disable utilization-aware idle selection")
 	noNewidleCost := flag.Bool("no-newidle-cost", false, "disable idle search cost limit")
 	noNewidleSampling := flag.Bool("no-newidle-sampling", false, "disable idle search sampling")
@@ -287,6 +325,9 @@ func main() {
 	features.DelayRequeue = !*noDelayRequeue
 	features.ProxyExec = !*noProxyExec
 	features.Hrtick = !*noHrtick
+	features.VrefUpdate = !*noVrefUpdate
+	features.WakeSync = !*noWakeSync
+	features.WaWeight = !*noWaWeight
 	features.SISUtil = !*noSISUtil
 	features.NewidleCost = !*noNewidleCost
 	features.NewidleSampling = !*noNewidleSampling
@@ -294,6 +335,10 @@ func main() {
 	features.Cgroups = !*disableCgroups
 	features.CpuMax = !*disableCPUQuota
 	features.Cpufreq = !*disableCpufreq
+	if err := prepareRuntime(); err != nil {
+		fmt.Fprintln(os.Stderr, "goeevdf:", err)
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ncpu, err := possibleCPUs()

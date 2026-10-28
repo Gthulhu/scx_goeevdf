@@ -65,6 +65,12 @@ func (i shardIO) Submit(cmd Cmd) error {
 }
 func (i shardIO) Idle(cpu int32) bool     { return i.s.io.Idle(i.s.global[cpu]) }
 func (i shardIO) CurrPid(cpu int32) int32 { return i.s.io.CurrPid(i.s.global[cpu]) }
+func (i shardIO) RunStart(cpu int32) uint64 {
+	if r, ok := i.s.io.(runStartIO); ok {
+		return r.RunStart(i.s.global[cpu])
+	}
+	return 0
+}
 func (i shardIO) SetQueued(cpu int32, n, keep uint64) {
 	i.s.io.SetQueued(i.s.global[cpu], n, keep)
 }
@@ -257,11 +263,14 @@ type shardTaskImage struct {
 	Queued                                  bool
 	Run                                     shardRavg
 	UtilEst, RunnableEst, WokeAt, SleptAt   uint64
+	WakeFlips, WakeDecayAt                  uint64
+	LastWakee                               int32
 }
 
 type shardGroupImage struct {
 	ID, Weight, Quota, Period uint64
 	HasQuota                  bool
+	Idle, Root                bool
 }
 
 // Export removes a queued, quota-parked, or sleeping task from its source policy, preserving
@@ -289,9 +298,10 @@ func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 		LastSum:         t.lastSum,
 		Queued:          t.state == Queued || t.state == Parked,
 		GroupConfigured: p.F.Cgroups && p.groups[t.Cgid] != nil,
+		WakeFlips:       t.wake.flips, WakeDecayAt: t.wake.decayAt, LastWakee: t.wake.lastWakee,
 	}
 	for g := p.group(t); g != nil; g = g.Parent {
-		group := shardGroupImage{ID: g.ID, Weight: g.Weight}
+		group := shardGroupImage{ID: g.ID, Weight: g.Weight, Idle: g.Idle, Root: g.root}
 		if b := g.bw; b != nil {
 			if b.owner == nil || b.owner != p.sharedQuota {
 				return nil, fmt.Errorf("%w: PID %d has unshared quota state", ErrTaskNotTransferable, pid)
@@ -378,6 +388,7 @@ func (s *ShardPolicy) Import(pid, slot, cpu int32, image []byte) error {
 	}
 	for _, ancestor := range img.Groups {
 		if g == nil || g.ID != ancestor.ID || g.Weight != ancestor.Weight ||
+			g.Idle != ancestor.Idle || g.root != ancestor.Root ||
 			(g.bw != nil) != ancestor.HasQuota {
 			return fmt.Errorf("destination cgroup ancestry differs for PID %d", pid)
 		}
@@ -419,6 +430,7 @@ func (s *ShardPolicy) Import(pid, slot, cpu int32, image []byte) error {
 		Vruntime: img.Vruntime, Req: img.Req, lag: img.Lag,
 		initial: img.Initial, Blocked: img.Blocked,
 		lastSum: img.LastSum, state: Sleeping}
+	t.wake = wakeState{flips: img.WakeFlips, decayAt: img.WakeDecayAt, lastWakee: img.LastWakee}
 	p.tasks[pid] = t
 	p.ld.tasks[t] = &taskLoadState{run: img.Run.restore(), utilEst: img.UtilEst,
 		runnableEst: img.RunnableEst, wokeAt: img.WokeAt, sleptAt: img.SleptAt}

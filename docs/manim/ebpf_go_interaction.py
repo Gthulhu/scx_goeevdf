@@ -101,8 +101,8 @@ class EbpfGoInteraction(Scene):
             "Synchronous Kernel Fast Paths",
             [
                 "Usersched Thread -> SCHED_DSQ_BASE+s",
-                "Idle CPU Wakeup  -> SCX_DSQ_LOCAL",
-                "keep_running     -> refill keep_slice",
+                "Ring Congestion  -> local fallback",
+                "dispatch/keep    -> refill keep_slice",
                 "hrtick bpf_timer -> SCX_KICK_PREEMPT",
             ],
             C_BORDER_KERNEL,
@@ -113,7 +113,7 @@ class EbpfGoInteraction(Scene):
             "Command Execution & Syscalls",
             [
                 "bpf_user_ringbuf_drain(cmds_s)",
-                "  -> scx_bpf_dsq_insert(DSQ_BASE+cpu)",
+                "  -> insert(SCX_DSQ_LOCAL_ON | cpu)",
                 "SEC(\"syscall\") ge_kick_prog",
                 "SEC(\"syscall\") ge_hrtick_prog",
             ],
@@ -153,7 +153,7 @@ class EbpfGoInteraction(Scene):
             [
                 "Open / SetShards / Load / Attach",
                 "ConsumeShard(s, &ev)  [non-blocking]",
-                "SubmitShard(s, &cmd) + Kick / Hrtick",
+                "SubmitShard(s, &cmd) + Kick",
             ],
             C_BORDER_GO,
         )

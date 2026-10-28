@@ -54,6 +54,14 @@ func (pk *Pack) lag(t *Task, request uint64) int64 {
 }
 
 func (pk *Pack) settle(t *Task) int64 {
+	ref := uint64(0)
+	if t.delay.pack != nil {
+		ref = t.delay.pack.Ref
+	}
+	return pk.settleAt(t, ref)
+}
+
+func (pk *Pack) settleAt(t *Task, ref uint64) int64 {
 	d := t.delay
 	t.delay = delayRec{}
 	if d.pack == nil {
@@ -62,7 +70,7 @@ func (pk *Pack) settle(t *Task) int64 {
 	if d.pack.emptyGen != d.gen {
 		return 0
 	}
-	return delayDebt(t.lag, int64(d.pack.Ref-d.ref), d.sum, t.Weight)
+	return delayDebt(t.lag, int64(ref-d.ref), d.sum, t.Weight)
 }
 
 func (pk *Pack) place(t *Task, sleep bool) {
@@ -83,11 +91,17 @@ func (pk *Pack) placeWith(t *Task, sleep, placeLag, relativeDeadline bool) {
 		if placeLag {
 			lag = t.pack.lag(t, max(t.Req.Slice, 1))
 		}
+	}
+	pk.placeWithLag(t, sleep, relativeDeadline, pk.Ref, lag)
+}
+
+func (pk *Pack) placeWithLag(t *Task, sleep, relativeDeadline bool, ref uint64, lag int64) {
+	if t.pack != nil {
 		t.pack.leave(t, true)
 	}
-	target := pk.Ref
-	if pk.W != 0 && placeLag {
-		target = place(pk.Ref, pk.W, lag, t.Weight)
+	target := ref
+	if pk.W != 0 {
+		target = place(ref, pk.W, lag, t.Weight)
 	}
 	if sleep || !relativeDeadline {
 		t.Req.Sleep()

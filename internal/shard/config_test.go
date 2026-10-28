@@ -75,6 +75,7 @@ func TestRealPolicyGroupConfigBroadcast(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
 		engines[id] = engine
 	}
 	c, _ := New(topo, engines)
@@ -99,6 +100,31 @@ func TestRealPolicyGroupConfigBroadcast(t *testing.T) {
 	stepAll(t, c)
 	if err := c.BroadcastConfig(Config{Kind: ConfigQuota, ID: 7, Quota: 100_000, Period: 1_000_000}); err == nil {
 		t.Fatal("multi-shard quota accepted without shared accounting")
+	}
+}
+
+func TestRootAndIdleGroupConfiguration(t *testing.T) {
+	io := &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0}, reject: true}
+	engine, err := NewPolicyEngine(io, []int32{0}, eevdf.Enums{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range []Config{
+		{Kind: ConfigGroup, ID: 1, Weight: 100, Root: true},
+		{Kind: ConfigGroup, ID: 2, Parent: 1, Weight: 200, Idle: true},
+	} {
+		if err := cfg.validate(); err != nil {
+			t.Fatal(err)
+		}
+		if err := engine.Configure(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := engine.Shard.Policy.SetCgroupIdle(1, true); err == nil {
+		t.Fatal("broadcast root was registered as an ordinary weighted group")
+	}
+	if err := (Config{Kind: ConfigGroup, ID: 1, Weight: 100, Root: true, Idle: true}).validate(); err == nil {
+		t.Fatal("idle root configuration accepted")
 	}
 }
 

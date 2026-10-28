@@ -9,8 +9,10 @@ typedef int64_t s64;
 
 struct ge_handle;
 struct ge_handle *ge_open(const char *path);
+int ge_enum_value(const char *, uint64_t *);
 int ge_set_tgid(struct ge_handle *, uint32_t);
 int ge_set_shards(struct ge_handle *, const uint32_t *, uint32_t, uint32_t);
+int ge_set_usersched_cpus(struct ge_handle *, const uint32_t *, uint32_t);
 int ge_register_usersched(struct ge_handle *, uint32_t, uint32_t);
 int ge_disable_op(struct ge_handle *, const char *);
 int ge_load(struct ge_handle *);
