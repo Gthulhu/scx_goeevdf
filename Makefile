@@ -1,10 +1,12 @@
 CLANG ?= clang
 BPFTOOL ?= $(firstword $(wildcard /usr/lib/linux-tools/*/bpftool))
 BPFTOOL := $(if $(BPFTOOL),$(BPFTOOL),bpftool)
-BPF_ARCH ?= x86
+BPF_HOST_ARCH := $(shell uname -m)
+BPF_ARCH ?= $(if $(filter x86_64 amd64,$(BPF_HOST_ARCH)),x86,$(if $(filter aarch64 arm64,$(BPF_HOST_ARCH)),arm64,$(BPF_HOST_ARCH)))
+BPF_CFLAGS ?= -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -Ibpf
 
 .PHONY: all bpf go build skeleton clean
-all: go
+all: build
 
 bpf: bpf/goeevdf.bpf.o
 
@@ -12,15 +14,21 @@ skeleton: internal/bpf/goeevdf.skel.h
 
 go: bpf
 	mkdir -p bin
-	go build -o bin/goeevdf ./cmd/goeevdf
+	CGO_ENABLED=1 go build -ldflags "-checklinkname=0" -o bin/goeevdf ./cmd/goeevdf
 
 build: go
 
-bpf/vmlinux.h:
+bpf/vmlinux.h: /sys/kernel/btf/vmlinux
 	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
 
 bpf/goeevdf.bpf.o: bpf/goeevdf.bpf.c bpf/intf.h bpf/vmlinux.h
-	$(CLANG) -O2 -g -target bpf -D__TARGET_ARCH_$(BPF_ARCH) -Ibpf -c $< -o $@
+	@if printf '%s\n' '#include "vmlinux.h"' \
+		'int probe(void) { return ((struct sched_ext_ops *)0)->cgroup_set_bandwidth != 0; }' | \
+		$(CLANG) -x c -fsyntax-only -Ibpf - >/dev/null 2>&1; then \
+		$(CLANG) $(BPF_CFLAGS) -DGOEEVDF_HAVE_CGROUP_SET_BANDWIDTH -c $< -o $@; \
+	else \
+		$(CLANG) $(BPF_CFLAGS) -c $< -o $@; \
+	fi
 
 internal/bpf/goeevdf.skel.h: bpf/goeevdf.bpf.o
 	$(BPFTOOL) gen skeleton $< > $@

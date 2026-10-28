@@ -7,7 +7,7 @@
 package bpf
 
 /*
-#cgo LDFLAGS: -lbpf -lelf -lz
+#cgo LDFLAGS: -l:libbpf.so.1 -lelf -lz
 #include "bridge.h"
 #include <stdlib.h>
 */

@@ -67,6 +67,29 @@ static int member_offset(const struct btf *btf, int type_id, const char *name)
 	return -ENOENT;
 }
 
+static int clear_ops_field(struct ge_handle *h, const char *field)
+{
+	struct bpf_map *map = find_map(h, "ge_ops");
+	const struct btf *btf = bpf_object__btf(h->obj);
+	size_t size;
+	void *data;
+	int type_id, offset;
+
+	if (!map || !btf)
+		return -ENOENT;
+	type_id = btf__find_by_name_kind(btf, "sched_ext_ops", BTF_KIND_STRUCT);
+	if (type_id < 0)
+		return type_id;
+	offset = member_offset(btf, type_id, field);
+	if (offset < 0)
+		return offset;
+	data = bpf_map__initial_value(map, &size);
+	if (!data || (size_t)offset + sizeof(void *) > size)
+		return -EINVAL;
+	memset((char *)data + offset, 0, sizeof(void *));
+	return 0;
+}
+
 static int disable_missing_ops(struct ge_handle *h)
 {
 	static const struct {
@@ -75,6 +98,7 @@ static int disable_missing_ops(struct ge_handle *h)
 		{ "tick", "ge_tick" },
 		{ "core_sched_before", "ge_core_sched_before" },
 		{ "dump_task", "ge_dump_task" },
+		{ "cgroup_set_bandwidth", "ge_cgroup_set_bandwidth" },
 	};
 	struct btf *kernel = btf__load_vmlinux_btf();
 	int kernel_id, i, err = 0;
@@ -90,11 +114,12 @@ static int disable_missing_ops(struct ge_handle *h)
 		if (member_offset(kernel, kernel_id, optional[i].field) >= 0)
 			continue;
 		prog = bpf_object__find_program_by_name(h->obj, optional[i].program);
-		if (!prog) {
-			err = -ENOENT;
-			break;
-		}
+		if (!prog)
+			continue;
 		err = bpf_program__set_autoload(prog, false);
+		if (err)
+			break;
+		err = clear_ops_field(h, optional[i].field);
 		if (err)
 			break;
 	}

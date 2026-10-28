@@ -3489,7 +3489,9 @@ func run(ctx context.Context, s *bpf.Sched, pol *eevdf.Policy) error {
 
 ### D5. Makefile
 
-照 qumun：`clang -target bpf` 編 `bpf/goeevdf.bpf.c`（`-I scx/scheds/include` 等）、`bpftool gen skeleton` 產生 `internal/bpf/goeevdf.skel.h`、靜態連結 libbpf，`go build -ldflags "-checklinkname=0" ./cmd/goeevdf`。scx 以 git submodule 引入，取 `common.bpf.h` 與 compat 標頭。
+目前 `internal/bpf` 以 `bpf_object__open_file()` 載入 BPF 物件，並直接使用系統 libbpf；因此 Makefile 編譯 `bpf/goeevdf.bpf.c`、由核心 BTF 產生 `bpf/vmlinux.h`，再以 `go build -ldflags "-checklinkname=0" ./cmd/goeevdf` 建置。cgroup bandwidth callback 僅在建置用的 `vmlinux.h` 有該欄位時編入；init args 的 bandwidth 欄位以 CO-RE 檢查，供較舊核心使用。`bpftool gen skeleton` 可作為獨立目標，但目前載入路徑不依賴它。
+
+qumun 的靜態 libbpf、`scx/` 標頭與 skeleton 流程不能直接複製：本 repo 目前沒有 libbpf/scx 子模組，且 bridge 使用直接 libbpf API。若日後改成 skeleton 載入，再一併引入並固定相應來源與版本。
 
 ## Part E：per-LLC 分片（Phase 5）
 

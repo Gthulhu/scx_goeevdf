@@ -15,7 +15,6 @@ struct task_struct *bpf_task_from_pid(s32) __ksym;
 void bpf_task_release(struct task_struct *) __ksym;
 bool bpf_cpumask_test_cpu(u32, const struct cpumask *) __ksym;
 void scx_bpf_cpuperf_set(s32, u32) __ksym __weak;
-void scx_bpf_dump_bstr(char *, const u64 *, u32) __ksym __weak;
 u32 scx_bpf_nr_cpu_ids(void) __ksym;
 
 #ifndef CLOCK_MONOTONIC
@@ -540,15 +539,26 @@ static __always_inline u64 cgroup_id(struct cgroup *cg)
 {
 	return cg ? BPF_CORE_READ(cg, kn, id) : 0;
 }
+
+struct scx_cgroup_init_args___goeevdf {
+	u32 weight;
+	u64 bw_period_us;
+	u64 bw_quota_us;
+	u64 bw_burst_us;
+} __attribute__((preserve_access_index));
+
 s32 BPF_STRUCT_OPS_SLEEPABLE(ge_cgroup_init, struct cgroup *cg, struct scx_cgroup_init_args *args)
 {
+	const struct scx_cgroup_init_args___goeevdf *compat = (const void *)args;
 	struct ev *e = ev_reserve(EV_CGRP_INIT, -1);
 	if (e) {
 		e->cgid = cgroup_id(cg);
 		e->arg[0] = args->weight;
-		e->arg[1] = args->bw_period_us;
-		e->arg[2] = args->bw_quota_us;
-		e->arg[3] = args->bw_burst_us;
+		if (bpf_core_field_exists(compat->bw_period_us)) {
+			e->arg[1] = BPF_CORE_READ(compat, bw_period_us);
+			e->arg[2] = BPF_CORE_READ(compat, bw_quota_us);
+			e->arg[3] = BPF_CORE_READ(compat, bw_burst_us);
+		}
 		bpf_ringbuf_submit(e, 0);
 	}
 	return 0;
@@ -581,6 +591,7 @@ void BPF_STRUCT_OPS(ge_cgroup_set_weight, struct cgroup *cg, u32 weight)
 		bpf_ringbuf_submit(e, 0);
 	}
 }
+#ifdef GOEEVDF_HAVE_CGROUP_SET_BANDWIDTH
 void BPF_STRUCT_OPS(ge_cgroup_set_bandwidth, struct cgroup *cg, u64 period, u64 quota, u64 burst)
 {
 	struct ev *e = ev_reserve(EV_CGRP_BW, -1);
@@ -592,6 +603,7 @@ void BPF_STRUCT_OPS(ge_cgroup_set_bandwidth, struct cgroup *cg, u64 period, u64 
 		bpf_ringbuf_submit(e, 0);
 	}
 }
+#endif
 static long hrtick_init_one(u32 cpu, void *ctx)
 {
 	int *err = ctx;
@@ -685,7 +697,9 @@ struct sched_ext_ops ge_ops = {
 	.cgroup_exit = (void *)ge_cgroup_exit,
 	.cgroup_move = (void *)ge_cgroup_move,
 	.cgroup_set_weight = (void *)ge_cgroup_set_weight,
+#ifdef GOEEVDF_HAVE_CGROUP_SET_BANDWIDTH
 	.cgroup_set_bandwidth = (void *)ge_cgroup_set_bandwidth,
+#endif
 	.init = (void *)ge_init,
 	.name = "goeevdf",
 };
