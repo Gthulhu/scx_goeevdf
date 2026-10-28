@@ -122,9 +122,18 @@ func (s *shardQuotaSnapshot) permits(id, quota, period uint64) bool {
 	return quota == 0
 }
 
-// Dynamic cpu.max changes are not supported in sharded mode. CgrpBW/CgrpInit
-// events cannot guarantee every owner installed a newly finite group before
-// its next dispatch; stop rather than run a task with no local quota state.
+func (s *shardQuotaSnapshot) require(id, quota, period uint64, path string) error {
+	if !s.permits(id, quota, period) {
+		return fmt.Errorf("dynamic cpu.max at %s is unsupported in sharded mode; restart or use --shards 1", path)
+	}
+	return nil
+}
+
+// Dynamic cpu.max changes are not supported in sharded mode. Configuration
+// broadcasts only enqueue mailbox work: while one owner installs a new finite
+// limit, another can still dispatch without its local bwGroup. Nor does a
+// cgroup event order the write against already queued events on other rings.
+// Stop rather than silently run with a partially installed quota.
 func (m *managedShard) checkQuota(path string) error {
 	if !m.multi {
 		return nil
@@ -144,8 +153,8 @@ func (m *managedShard) checkQuota(path string) error {
 			}
 			return err
 		}
-		if !m.quotaSnapshot.permits(id, quota, period) {
-			return fmt.Errorf("dynamic cpu.max at %s is unsupported in sharded mode; restart or use --shards 1", path)
+		if err := m.quotaSnapshot.require(id, quota, period, path); err != nil {
+			return err
 		}
 		if path == "/sys/fs/cgroup" {
 			break
@@ -240,7 +249,22 @@ func (m *managedShard) Configure(cfg shard.Config) error {
 	if err := m.PolicyEngine.Configure(cfg); err != nil {
 		return err
 	}
-	if cfg.Kind == shard.ConfigRemoveGroup {
+	switch cfg.Kind {
+	case shard.ConfigGroup:
+		if m.groups.applied == nil {
+			m.groups.applied = make(map[uint64]groupConfig)
+		}
+		config := m.groups.applied[cfg.ID]
+		config.parent, config.weight = cfg.Parent, cfg.Weight
+		m.groups.applied[cfg.ID] = config
+	case shard.ConfigQuota:
+		if m.groups.applied == nil {
+			m.groups.applied = make(map[uint64]groupConfig)
+		}
+		config := m.groups.applied[cfg.ID]
+		config.quota, config.period = cfg.Quota, cfg.Period
+		m.groups.applied[cfg.ID] = config
+	case shard.ConfigRemoveGroup:
 		delete(m.groups.last, cfg.ID)
 		delete(m.groups.applied, cfg.ID)
 		delete(m.groups.paths, cfg.ID)
@@ -391,6 +415,9 @@ func newGroupBroadcaster(snapshot *shardQuotaSnapshot, owners []*managedShard) (
 		if !ok {
 			return nil, fmt.Errorf("cgroup %d was not configured before attach", id)
 		}
+		if expected := snapshot.groups[id]; config.quota != expected.quota || config.period != expected.period {
+			return nil, fmt.Errorf("cgroup %d cpu.max changed during shard startup", id)
+		}
 		for shardID := 1; shardID < len(owners); shardID++ {
 			if owners[shardID].groups.applied[id] != config {
 				return nil, fmt.Errorf("cgroup %d configuration differs on shard %d", id, shardID)
@@ -416,8 +443,10 @@ func (b *groupBroadcaster) announcePath(c *shard.Coordinator, path string) error
 	if err != nil {
 		return err
 	}
-	if b.snapshot != nil && !b.snapshot.permits(id, quota, period) {
-		return fmt.Errorf("dynamic cpu.max at %s is unsupported in sharded mode; restart or use --shards 1", path)
+	if b.snapshot != nil {
+		if err := b.snapshot.require(id, quota, period, path); err != nil {
+			return err
+		}
 	}
 	parent := uint64(0)
 	if path != "/sys/fs/cgroup" {
@@ -643,9 +672,8 @@ func shardWorker(ctx context.Context, s *bpf.Sched, c *shard.Coordinator, broadc
 
 // runSharded runs one pinned, registered scheduling thread and one BPF ring
 // consumer per LLC shard. The caller supplies sysfs-derived topology/groups.
-// Finite cpu.max at startup uses the single-owner runner until quota-controlled
-// task handoff is supported; runtime finite quota creation or reconfiguration
-// stops the sharded scheduler instead of applying an unsafe partial update.
+// Startup cpu.max budgets are shared across owners. Runtime quota changes
+// still stop rather than applying a partially installed limit.
 func runSharded(ctx context.Context, object string, features eevdf.Features,
 	topo eevdf.Topology, groups [][]int32) error {
 	ncpu, err := possibleCPUs()
@@ -673,11 +701,6 @@ func runSharded(ctx context.Context, object string, features eevdf.Features,
 		}
 		quotaPool = eevdf.NewSharedQuotaPool()
 		for id, config := range quotaSnapshot.groups {
-			if config.quota != 0 {
-				// The adapter cannot export quota-controlled tasks across shards.
-				// Keep the single-owner path until that handoff is supported.
-				return run(ctx, object, features)
-			}
 			if err := quotaPool.Configure(id, config.quota, config.period); err != nil {
 				return err
 			}

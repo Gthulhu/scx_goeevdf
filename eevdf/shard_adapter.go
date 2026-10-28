@@ -17,6 +17,12 @@ type ShardPolicy struct {
 	local       map[int32]int32
 	io          IO
 	suppressPID int32
+	stops       map[int32]shardStop
+}
+
+type shardStop struct {
+	slot, dst int32
+	seq       uint64
 }
 
 // ErrTaskNotTransferable indicates a normal ownership state that must remain
@@ -107,7 +113,8 @@ func NewShardPolicy(io IO, cpus []int32, enums Enums) (*ShardPolicy, error) {
 	if io == nil || len(cpus) == 0 {
 		return nil, errors.New("shard needs IO and at least one CPU")
 	}
-	s := &ShardPolicy{global: append([]int32(nil), cpus...), local: make(map[int32]int32), io: io}
+	s := &ShardPolicy{global: append([]int32(nil), cpus...), local: make(map[int32]int32),
+		io: io, stops: make(map[int32]shardStop)}
 	for c, global := range cpus {
 		if global < 0 {
 			return nil, fmt.Errorf("invalid CPU %d", global)
@@ -181,15 +188,15 @@ func (s *ShardPolicy) HandleForTransfer(slot int32, ev Event, sourceCPU int32) e
 	return s.Handle(slot, ev)
 }
 
-// CanTransfer distinguishes ordinary running/parked state from an actually
-// detached pending task, so a cpumask event does not repeatedly retry a
-// transfer that must await the next kernel enqueue.
+// CanTransfer distinguishes running state from a detached pending task.
+// Shared-quota parked tasks are pending too; their backlog is rebuilt by Import.
 func (s *ShardPolicy) CanTransfer(pid, slot int32) bool {
 	p := s.Policy
 	t := p.tasks[pid]
 	if t == nil || t.Slot != uint32(slot) ||
-		t.state != Queued && t.state != Sleeping ||
-		t.Blocked || t.backlog != nil {
+		t.state != Queued && t.state != Sleeping && t.state != Parked ||
+		t.Blocked || (t.backlog != nil && t.state != Parked) ||
+		(t.state == Parked && t.backlog == nil) {
 		return false
 	}
 	if _, active := p.act.migrate[t]; active {
@@ -257,9 +264,9 @@ type shardGroupImage struct {
 	HasQuota                  bool
 }
 
-// Export removes a queued or sleeping task from its source policy, preserving
-// virtual lag and PELT task history. Running and quota-parked tasks cannot be
-// exported; queued tasks with quotas require a shared pool on every ancestor.
+// Export removes a queued, quota-parked, or sleeping task from its source policy, preserving
+// virtual lag and PELT task history. Running tasks cannot be exported; tasks
+// with quotas require a shared pool on every ancestor.
 // On failure the source remains unchanged.
 func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 	p := s.Policy
@@ -267,10 +274,11 @@ func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 	if t == nil || t.Slot != uint32(slot) {
 		return nil, fmt.Errorf("PID %d slot %d is not local", pid, slot)
 	}
-	if t.state != Queued && t.state != Sleeping {
-		return nil, fmt.Errorf("%w: PID %d is not queued or sleeping", ErrTaskNotTransferable, pid)
+	if t.state != Queued && t.state != Sleeping && t.state != Parked {
+		return nil, fmt.Errorf("%w: PID %d is not queued, parked, or sleeping", ErrTaskNotTransferable, pid)
 	}
-	if _, active := p.act.migrate[t]; active || t.backlog != nil || t.Blocked {
+	if _, active := p.act.migrate[t]; active || (t.backlog != nil && t.state != Parked) ||
+		(t.state == Parked && t.backlog == nil) || t.Blocked {
 		return nil, fmt.Errorf("%w: PID %d has active, proxy, or bandwidth state", ErrTaskNotTransferable, pid)
 	}
 	img := shardTaskImage{
@@ -279,7 +287,7 @@ func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 		CustomSlice: t.CustomSlice, Policy: t.Policy, Vruntime: t.Vruntime,
 		Req: t.Req, Lag: t.lag, Initial: t.initial, Blocked: t.Blocked,
 		LastSum:         t.lastSum,
-		Queued:          t.state == Queued,
+		Queued:          t.state == Queued || t.state == Parked,
 		GroupConfigured: p.F.Cgroups && p.groups[t.Cgid] != nil,
 	}
 	for g := p.group(t); g != nil; g = g.Parent {
@@ -324,6 +332,7 @@ func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 	}
 	// All failure checks and serialization are complete before detachment.
 	p.removeQueued(t)
+	p.removeBacklog(t)
 	if t.pack != nil {
 		t.pack.leave(t, true)
 		p.recomputeWeights(t.Cpu)
@@ -331,6 +340,7 @@ func (s *ShardPolicy) Export(pid, slot int32) ([]byte, error) {
 	delete(p.ld.tasks, t)
 	delete(p.lastStop, t)
 	delete(p.tasks, pid)
+	delete(s.stops, pid)
 	if pub, ok := p.io.(publishIO); ok {
 		pub.Publish(t.Slot, TaskPub{})
 	}
@@ -460,10 +470,80 @@ func (s *ShardPolicy) Steal(from, dst int32, level int) (pid, slot int32, ok boo
 	return chosen.Pid, int32(chosen.Slot), true, nil
 }
 
-// StopFor cannot migrate a running task without an acknowledged STOP and a
-// subsequent kernel enqueue. Fail explicitly instead of moving a live task.
+// StopFor requests preemption only for a task currently running on the source
+// CPU. A successful command is not an acknowledgement; StopTarget waits for a
+// newer enqueue before the coordinator may export the task.
 func (s *ShardPolicy) StopFor(cpu, pid, dst int32) error {
-	return errors.New("cross-shard active balance requires STOP acknowledgement")
+	local, owned := s.local[cpu]
+	if !owned || dst < 0 || pid <= 0 {
+		return ErrTaskNotTransferable
+	}
+	if _, same := s.local[dst]; same {
+		return ErrTaskNotTransferable
+	}
+	t := s.Policy.tasks[pid]
+	if t == nil || t.Slot == 0 || t.Cpu != local || t.state != Dispatched ||
+		s.Policy.cpus[local].task != t || s.io.CurrPid(cpu) != pid {
+		return ErrTaskNotTransferable
+	}
+	if _, migrating := s.Policy.act.migrate[t]; migrating {
+		return ErrTaskNotTransferable
+	}
+	if _, pending := s.stops[pid]; pending {
+		return ErrTaskNotTransferable
+	}
+	a, ok := s.io.(AffinityIO)
+	if !ok {
+		return ErrTaskNotTransferable
+	}
+	mask, err := a.Affinity(pid)
+	if err != nil {
+		return fmt.Errorf("%w: cannot verify STOP destination affinity: %v", ErrTaskNotTransferable, err)
+	}
+	allowed := false
+	for _, c := range mask {
+		allowed = allowed || c == dst
+	}
+	if !allowed {
+		return ErrTaskNotTransferable
+	}
+	if err := s.io.Submit(Cmd{Kind: CmdStop, Pid: pid, Cpu: cpu, Slot: t.Slot}); err != nil {
+		return fmt.Errorf("%w: STOP submit failed: %v", ErrTaskNotTransferable, err)
+	}
+	s.stops[pid] = shardStop{slot: int32(t.Slot), dst: dst, seq: t.EnqSeq}
+	return nil
+}
+
+// StopTarget reports an acknowledged stop only when the kernel has enqueued a
+// newer generation of the same task and the destination is still permitted.
+// A duplicate event from the old generation must not be used as an ack.
+func (s *ShardPolicy) StopTarget(pid, slot int32, seq uint64) (dst int32, stale, acknowledged bool) {
+	stop, ok := s.stops[pid]
+	if !ok || stop.slot != slot {
+		return 0, false, false
+	}
+	if seq <= stop.seq {
+		return 0, true, false
+	}
+	delete(s.stops, pid)
+	a, ok := s.io.(AffinityIO)
+	if !ok {
+		return 0, false, false
+	}
+	mask, err := a.Affinity(pid)
+	if err != nil {
+		return 0, false, false
+	}
+	for _, c := range mask {
+		if c == stop.dst {
+			return stop.dst, false, true
+		}
+	}
+	return 0, false, false
+}
+
+func (s *ShardPolicy) ClearStop(pid int32) {
+	delete(s.stops, pid)
 }
 
 // Tick schedules local CPUs only; call Periodic separately when advancing

@@ -150,6 +150,82 @@ func TestCgroupChangeMailboxAppliedByOwner(t *testing.T) {
 	}
 }
 
+func TestManagedShardConfigureKeepsGroupCacheCoherent(t *testing.T) {
+	pool := eevdf.NewSharedQuotaPool()
+	engine, err := shard.NewPolicyEngineWithQuota(shardFrequencyIO{}, []int32{0}, eevdf.Enums{}, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &managedShard{PolicyEngine: engine, groups: groupSync{
+		applied: map[uint64]groupConfig{7: {weight: 100, period: 1_000_000}},
+		paths:   map[uint64]string{7: "/sys/fs/cgroup/existing"},
+	}}
+	for _, cfg := range []shard.Config{
+		{Kind: shard.ConfigGroup, ID: 7, Weight: 200},
+		{Kind: shard.ConfigGroup, ID: 8, Parent: 7, Weight: 300},
+	} {
+		if err := m.Configure(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := m.groups.applied[7]; got.weight != 200 || got.period != 1_000_000 {
+		t.Fatalf("weight update lost prior quota: %+v", got)
+	}
+	if err := pool.Configure(8, 10_000, 1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Configure(shard.Config{Kind: shard.ConfigQuota, ID: 8, Quota: 10_000, Period: 1_000_000}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.groups.applied[8]; got.parent != 7 || got.weight != 300 || got.quota != 10_000 {
+		t.Fatalf("quota update lost group configuration: %+v", got)
+	}
+	if err := m.Configure(shard.Config{Kind: shard.ConfigQuota, ID: 8, Period: 1_000_000}); err == nil {
+		t.Fatal("local cache must not accept a quota change rejected by the shared pool")
+	}
+	if m.groups.applied[8].quota != 10_000 {
+		t.Fatal("failed quota update changed local cache")
+	}
+	if err := pool.Configure(8, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Configure(shard.Config{Kind: shard.ConfigQuota, ID: 8, Period: 1_000_000}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.groups.applied[8]; got.quota != 0 || got.period != 1_000_000 {
+		t.Fatalf("quota disable left stale cache: %+v", got)
+	}
+	if m.groups.paths[7] != "/sys/fs/cgroup/existing" {
+		t.Fatal("broadcast removed an existing group path")
+	}
+	if err := m.Configure(shard.Config{Kind: shard.ConfigRemoveGroup, ID: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.groups.applied[8]; ok {
+		t.Fatal("group removal left cached configuration")
+	}
+}
+
+func TestGroupSyncRecordsPathAfterBroadcastCacheHit(t *testing.T) {
+	const root = "/sys/fs/cgroup"
+	id, err := cgroupID(root)
+	if err != nil {
+		t.Skipf("cgroupfs unavailable: %v", err)
+	}
+	config := groupConfig{weight: readWeight(root)}
+	if quota, period, err := readQuota(root); err == nil {
+		config.quota, config.period = quota, period
+	}
+	s := groupSync{applied: map[uint64]groupConfig{id: config}}
+	p := eevdf.New(shardFrequencyIO{}, 1, eevdf.Enums{})
+	if err := s.configure(p, root); err != nil {
+		t.Fatal(err)
+	}
+	if s.paths[id] != root {
+		t.Fatal("matching broadcast cache entry prevented recording the lazy group path")
+	}
+}
+
 func TestShardedQuotaPreflightFailure(t *testing.T) {
 	if _, err := readShardQuotaSnapshot("cmd/goeevdf/no-such-cgroup"); err == nil {
 		t.Fatal("accepted unreadable cgroup tree")
@@ -173,6 +249,102 @@ func TestShardedQuotaPreflightFailure(t *testing.T) {
 			t.Fatalf("quota id=%d quota=%d period=%d permitted=%v, want %v",
 				tt.id, tt.quota, tt.period, got, tt.want)
 		}
+		err := snapshot.require(tt.id, tt.quota, tt.period, "/sys/fs/cgroup/example")
+		if tt.want && err != nil {
+			t.Fatalf("permitted quota id=%d rejected: %v", tt.id, err)
+		}
+		if !tt.want && (err == nil || !strings.Contains(err.Error(), "dynamic cpu.max")) {
+			t.Fatalf("changed quota id=%d accepted: %v", tt.id, err)
+		}
+	}
+}
+
+func TestShardedQuotaStartupRequiresConfiguredSnapshot(t *testing.T) {
+	const root = "/sys/fs/cgroup"
+	id, err := cgroupID(root)
+	if err != nil {
+		t.Skipf("cgroupfs unavailable: %v", err)
+	}
+	quota, period, err := readQuota(root)
+	if err != nil {
+		t.Skipf("cpu.max unavailable: %v", err)
+	}
+	snapshot := &shardQuotaSnapshot{
+		paths: []string{root}, groups: map[uint64]shardQuota{id: {quota, period}},
+	}
+	owners := []*managedShard{
+		{groups: groupSync{applied: map[uint64]groupConfig{id: {quota: quota + 1, period: period}}}},
+		{groups: groupSync{applied: map[uint64]groupConfig{id: {quota: quota + 1, period: period}}}},
+	}
+	if _, err := newGroupBroadcaster(snapshot, owners); err == nil {
+		t.Fatal("attached with a startup quota different from the snapshot")
+	}
+	for _, owner := range owners {
+		owner.groups.applied[id] = groupConfig{quota: quota, period: period}
+	}
+	if _, err := newGroupBroadcaster(snapshot, owners); err != nil {
+		t.Fatalf("matching startup quota rejected: %v", err)
+	}
+}
+
+func TestShardedRuntimeQuotaChangeFailsBeforeBroadcastOrDispatch(t *testing.T) {
+	const root = "/sys/fs/cgroup"
+	id, err := cgroupID(root)
+	if err != nil {
+		t.Skipf("cgroupfs unavailable: %v", err)
+	}
+	quota, period, err := readQuota(root)
+	if err != nil {
+		t.Skipf("cpu.max unavailable: %v", err)
+	}
+	previous := quota + 1
+	if quota == ^uint64(0) {
+		previous = quota - 1
+	}
+	snapshot := &shardQuotaSnapshot{groups: map[uint64]shardQuota{
+		id: {quota: previous, period: period},
+	}}
+	m := &managedShard{multi: true, quotaSnapshot: snapshot}
+	if err := m.checkQuota(root); err == nil || !strings.Contains(err.Error(), "dynamic cpu.max") {
+		t.Fatalf("owner accepted changed cpu.max: %v", err)
+	}
+	b := &groupBroadcaster{
+		paths:    map[uint64]string{id: root},
+		applied:  map[uint64]groupConfig{id: {quota: previous, period: period}},
+		snapshot: snapshot,
+	}
+	// A cached path skips the pre-route broadcast, but its owner must still
+	// reject the live change. The bandwidth event must reject it as well.
+	if err := b.beforeEnqueue(nil, 1, id); err != nil {
+		t.Fatalf("cached path unexpectedly required a broadcast: %v", err)
+	}
+	if err := b.event(nil, bpf.EvCgrpBW, id); err == nil || !strings.Contains(err.Error(), "dynamic cpu.max") {
+		t.Fatalf("bandwidth event accepted changed cpu.max: %v", err)
+	}
+	if got := b.applied[id]; got.quota != previous {
+		t.Fatalf("rejected bandwidth event updated cached quota: %+v", got)
+	}
+}
+
+func TestShardedNewFiniteGroupFailsBeforeAnnouncement(t *testing.T) {
+	const root = "/sys/fs/cgroup"
+	quota, _, err := readQuota(root)
+	if err != nil {
+		t.Skipf("cpu.max unavailable: %v", err)
+	}
+	if quota == 0 {
+		t.Skip("cgroupfs root has no finite quota to emulate a new finite group")
+	}
+	snapshot := &shardQuotaSnapshot{groups: make(map[uint64]shardQuota)}
+	b := &groupBroadcaster{
+		paths: make(map[uint64]string), applied: make(map[uint64]groupConfig),
+		snapshot: snapshot,
+	}
+	if err := b.announcePath(nil, root); err == nil || !strings.Contains(err.Error(), "dynamic cpu.max") {
+		t.Fatalf("new finite group reached broadcast: %v", err)
+	}
+	if len(b.paths) != 0 || len(b.applied) != 0 {
+		t.Fatal("rejected group was cached despite failed pre-route check")
 	}
 }
 

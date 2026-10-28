@@ -103,6 +103,10 @@ func (s *groupSync) configure(p *eevdf.Policy, path string) error {
 	}
 	previous, known := s.applied[id]
 	if known && previous == config {
+		if s.paths == nil {
+			s.paths = make(map[uint64]string)
+		}
+		s.paths[id] = path
 		return nil
 	}
 	if err := p.SetCgroup(id, parentID, config.weight); err != nil {

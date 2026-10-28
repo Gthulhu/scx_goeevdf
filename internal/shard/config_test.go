@@ -133,3 +133,118 @@ func TestQuotaConfigBroadcastRequiresAndUsesSharedPool(t *testing.T) {
 	}
 	stepAll(t, c)
 }
+
+func TestSharedQuotaParkedHandoffAndRefill(t *testing.T) {
+	topo, _ := NewTopology(80, [][]int32{cpusFrom(0, 40), cpusFrom(40, 40)}, false)
+	pool := eevdf.NewSharedQuotaPool()
+	engines := make([]Engine, 2)
+	ios := make([]*shardPolicyIO, 2)
+	for id := range engines {
+		ios[id] = &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40}, idle: true}
+		engine, err := NewPolicyEngineWithQuota(ios[id], topo.CPUs[id], eevdf.Enums{}, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		engines[id] = engine
+	}
+	c, _ := New(topo, engines)
+	if err := pool.Configure(7, 10_000, 1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range []Config{
+		{Kind: ConfigGroup, ID: 7, Weight: 100},
+		{Kind: ConfigQuota, ID: 7, Quota: 10_000, Period: 1_000_000},
+	} {
+		if err := c.BroadcastConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stepAll(t, c)
+	pool.Refill(10_000_000)
+	for _, ev := range []eevdf.Event{
+		{Kind: eevdf.EvEnqueue, Pid: 11, Cpu: 0, Cgid: 7, Weight: 100},
+		{Kind: eevdf.EvEnqueue, Pid: 12, Cpu: 0, Cgid: 7, Weight: 100},
+	} {
+		if err := c.Route(0, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stepAll(t, c)
+	if len(ios[0].commands) != 1 || ios[0].commands[0].Slice != 10_000 {
+		t.Fatalf("source over-allocated quota: %+v", ios[0].commands)
+	}
+	if err := c.Handoff(12, 0, 40); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if owner, ok := c.Owner(12, 0); !ok || owner != 1 {
+		t.Fatalf("parked task not adopted: %d %v", owner, ok)
+	}
+	if len(ios[1].commands) != 0 {
+		t.Fatalf("destination dispatched without shared budget: %+v", ios[1].commands)
+	}
+	pool.Refill(11_000_000)
+	if err := c.Periodic(1, 11_000_000); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if len(ios[1].commands) != 1 || ios[1].commands[0].Pid != 12 ||
+		ios[1].commands[0].Slice != 10_000 {
+		t.Fatalf("destination did not dispatch after refill: %+v", ios[1].commands)
+	}
+}
+
+func TestSharedQuotaRemoteRunningEnqueueParksAndTransfers(t *testing.T) {
+	topo, _ := NewTopology(80, [][]int32{cpusFrom(0, 40), cpusFrom(40, 40)}, false)
+	pool := eevdf.NewSharedQuotaPool()
+	engines := make([]Engine, 2)
+	ios := make([]*shardPolicyIO, 2)
+	for id := range engines {
+		ios[id] = &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40}, idle: true}
+		engine, err := NewPolicyEngineWithQuota(ios[id], topo.CPUs[id], eevdf.Enums{}, pool)
+		if err != nil {
+			t.Fatal(err)
+		}
+		engines[id] = engine
+	}
+	c, _ := New(topo, engines)
+	if err := pool.Configure(7, 10_000, 1_000_000); err != nil {
+		t.Fatal(err)
+	}
+	for _, cfg := range []Config{
+		{Kind: ConfigGroup, ID: 7, Weight: 100},
+		{Kind: ConfigQuota, ID: 7, Quota: 10_000, Period: 1_000_000},
+	} {
+		if err := c.BroadcastConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stepAll(t, c)
+	if err := c.Route(0, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23, Cpu: 0, Cgid: 7, Weight: 100}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if len(ios[0].commands) != 1 {
+		t.Fatalf("task was not dispatched: %+v", ios[0].commands)
+	}
+	if err := c.Route(0, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23,
+		Cpu: 40, Cgid: 7, Weight: 100, SumExec: 10_000, EnqSeq: 2}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if owner, ok := c.Owner(23, 0); !ok || owner != 1 {
+		t.Fatalf("remote enqueue was not transferred: %d %v", owner, ok)
+	}
+	if len(ios[0].commands) != 1 || len(ios[1].commands) != 0 {
+		t.Fatalf("exhausted task dispatched before refill: %v / %v", ios[0].commands, ios[1].commands)
+	}
+	pool.Refill(10_000_000)
+	pool.Refill(11_000_000)
+	if err := c.Periodic(1, 11_000_000); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if len(ios[1].commands) != 1 || ios[1].commands[0].Pid != 23 {
+		t.Fatalf("transferred task did not resume: %+v", ios[1].commands)
+	}
+}

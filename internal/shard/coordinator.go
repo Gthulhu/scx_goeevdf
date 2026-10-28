@@ -300,8 +300,8 @@ func (c *Coordinator) Steal(from, dst int32, level int) error {
 	return nil
 }
 
-// StopFor delivers an active-balance stop request only to the source CPU's
-// owner; its eventual enqueue is routed by slot as usual.
+// StopFor delivers an active-balance stop request only to the source owner.
+// Submission never transfers ownership; a newer enqueue acknowledges STOP.
 func (c *Coordinator) StopFor(cpu, pid, dst int32) error {
 	src, ok := c.topology.OwnerCPU(cpu)
 	if !ok {
@@ -315,7 +315,12 @@ func (c *Coordinator) StopFor(cpu, pid, dst int32) error {
 		return ErrActiveStopUnsupported
 	}
 	c.mu.Lock()
-	c.appendLocked(src, message{kind: stopMsg, pid: pid, from: cpu, dst: dst})
+	o := c.byPID[pid]
+	if o == nil || o.pending || o.shard != src {
+		c.mu.Unlock()
+		return fmt.Errorf("PID %d is not owned by source CPU %d", pid, cpu)
+	}
+	c.appendLocked(src, message{kind: stopMsg, pid: pid, slot: o.slot, from: cpu, dst: dst})
 	c.mu.Unlock()
 	return nil
 }
@@ -371,6 +376,41 @@ func (c *Coordinator) process(id int, m message) error {
 				return nil
 			}
 			if m.event.Kind == eevdf.EvEnqueue {
+				if stop, ok := e.(interface {
+					StopTarget(int32, int32, uint64) (int32, bool, bool)
+				}); ok {
+					// Affinity I/O may block. The worker lock still serializes
+					// this shard's events while Route can use c.mu concurrently.
+					c.mu.Unlock()
+					dst, stale, acknowledged := stop.StopTarget(m.pid, m.slot, m.event.EnqSeq)
+					c.mu.Lock()
+					if c.slots[m.slot] != o || o.pid != m.pid {
+						c.mu.Unlock()
+						return nil
+					}
+					if o.pending {
+						o.waiting = append(o.waiting, m)
+						c.mu.Unlock()
+						return nil
+					}
+					if o.shard != id {
+						c.appendLocked(o.shard, m)
+						c.mu.Unlock()
+						return nil
+					}
+					if stale {
+						c.mu.Unlock()
+						return nil
+					}
+					if acknowledged {
+						// A local kernel enqueue acknowledges STOP just as a
+						// remote enqueue does. Use the requested, rechecked
+						// destination for the existing transfer protocol.
+						if owner, ok := c.topology.OwnerCPU(m.event.Cpu); ok && owner == id {
+							m.event.Cpu = dst
+						}
+					}
+				}
 				if dest, ok := c.topology.OwnerCPU(m.event.Cpu); ok && dest != id {
 					deferred := o.deferRemote && o.deferCPU == m.event.Cpu
 					if deferred {
@@ -460,6 +500,11 @@ func (c *Coordinator) process(id int, m message) error {
 		if err := e.Handle(m.slot, m.event); err != nil {
 			return err
 		}
+		if m.event.Kind == eevdf.EvSleep || m.event.Kind == eevdf.EvDequeue || m.event.Kind == eevdf.EvExit {
+			if stop, ok := e.(interface{ ClearStop(int32) }); ok {
+				stop.ClearStop(m.pid)
+			}
+		}
 		if m.event.Kind == eevdf.EvEnqueue {
 			c.mu.Lock()
 			if o := c.slots[m.slot]; o != nil && o.pid == m.pid && o.shard == id {
@@ -538,7 +583,25 @@ func (c *Coordinator) process(id int, m message) error {
 		}
 		c.mu.Unlock()
 	case stopMsg:
-		return e.StopFor(m.from, m.pid, m.dst)
+		c.mu.Lock()
+		o := c.slots[m.slot]
+		valid := o != nil && o.pid == m.pid && o.shard == id && !o.pending
+		c.mu.Unlock()
+		if !valid {
+			return nil
+		}
+		err := e.StopFor(m.from, m.pid, m.dst)
+		if errors.Is(err, eevdf.ErrTaskNotTransferable) {
+			return nil
+		}
+		if err == nil {
+			c.mu.Lock()
+			if o := c.slots[m.slot]; o != nil && o.pid == m.pid && o.shard == id && !o.pending {
+				o.cpu = m.from
+			}
+			c.mu.Unlock()
+		}
+		return err
 	case periodicMsg:
 		if p, ok := e.(interface{ Periodic(uint64) }); ok {
 			p.Periodic(m.now)

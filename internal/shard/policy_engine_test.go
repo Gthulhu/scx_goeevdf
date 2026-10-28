@@ -11,26 +11,28 @@ import (
 )
 
 type shardPolicyIO struct {
-	mu       sync.Mutex
-	allowed  []int32
-	commands []eevdf.Cmd
-	queued   map[int32]uint64
-	writes   []int32
-	idle     bool
-	reject   bool
+	mu         sync.Mutex
+	allowed    []int32
+	commands   []eevdf.Cmd
+	queued     map[int32]uint64
+	writes     []int32
+	idle       bool
+	reject     bool
+	rejectStop bool
+	curr       int32
 }
 
 func (i *shardPolicyIO) Submit(cmd eevdf.Cmd) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	if i.reject && cmd.Kind == eevdf.CmdDispatch {
+	if i.reject && cmd.Kind == eevdf.CmdDispatch || i.rejectStop && cmd.Kind == eevdf.CmdStop {
 		return errors.New("dispatch temporarily unavailable")
 	}
 	i.commands = append(i.commands, cmd)
 	return nil
 }
 func (i *shardPolicyIO) Idle(int32) bool     { return i.idle }
-func (i *shardPolicyIO) CurrPid(int32) int32 { return 0 }
+func (i *shardPolicyIO) CurrPid(int32) int32 { return i.curr }
 func (i *shardPolicyIO) SetQueued(cpu int32, n, _ uint64) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -233,11 +235,14 @@ func TestRealPolicyEngineDefersRunningHandoff(t *testing.T) {
 	if id, ok := c.Owner(23, 23); !ok || id != 0 {
 		t.Fatal("deferred running handoff lost original owner")
 	}
-	if err := c.StopFor(0, 23, 40); !errors.Is(err, ErrActiveStopUnsupported) {
-		t.Fatalf("active stop was not synchronously disabled: %v", err)
+	if err := c.StopFor(0, 23, 40); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Step(0); err != nil {
+		t.Fatal(err)
 	}
 	if len(io0.commands) != 1 {
-		t.Fatalf("unsupported STOP submitted a command: %+v", io0.commands)
+		t.Fatalf("STOP was sent without kernel current-PID evidence: %+v", io0.commands)
 	}
 	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23, Cpu: 40,
 		Weight: 100, EnqSeq: 2}); err != nil {
@@ -250,6 +255,114 @@ func TestRealPolicyEngineDefersRunningHandoff(t *testing.T) {
 	}
 	if len(io0.commands) != 1 {
 		t.Fatalf("source redispatched running task during handoff: %+v", io0.commands)
+	}
+}
+
+func TestActiveStopRequiresNewKernelEnqueueBeforeTransfer(t *testing.T) {
+	topo, _ := NewTopology(80, [][]int32{cpusFrom(0, 40), cpusFrom(40, 40)}, false)
+	io0 := &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40}, idle: true}
+	io1 := &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40}, idle: true}
+	a, _ := NewPolicyEngine(io0, topo.CPUs[0], eevdf.Enums{})
+	b, _ := NewPolicyEngine(io1, topo.CPUs[1], eevdf.Enums{})
+	c, _ := New(topo, []Engine{a, b})
+	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23, Cpu: 0, Weight: 100, EnqSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	io0.curr = 23
+	if err := c.StopFor(0, 23, 40); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if len(io0.commands) != 2 || io0.commands[1].Kind != eevdf.CmdStop ||
+		io0.commands[1].Cpu != 0 || io0.commands[1].Pid != 23 {
+		t.Fatalf("STOP was not sent to running source: %+v", io0.commands)
+	}
+	if owner, ok := c.Owner(23, 23); !ok || owner != 0 {
+		t.Fatal("STOP submission prematurely transferred running task")
+	}
+	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23, Cpu: 0, Weight: 100, EnqSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if owner, ok := c.Owner(23, 23); !ok || owner != 0 || len(io0.commands) != 2 {
+		t.Fatal("stale enqueue acknowledged STOP")
+	}
+	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23,
+		Cpu: 0, Weight: 100, EnqSeq: 2}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if owner, ok := c.Owner(23, 23); !ok || owner != 1 {
+		t.Fatalf("acknowledged task not handed off: owner %d, registered %v", owner, ok)
+	}
+	if len(io0.commands) != 2 || len(io1.commands) != 1 || io1.commands[0].Pid != 23 {
+		t.Fatalf("source redispatched or destination did not dispatch: %v / %v", io0.commands, io1.commands)
+	}
+}
+
+func TestActiveStopFailureAndStaleRequestRetainSource(t *testing.T) {
+	topo, _ := NewTopology(80, [][]int32{cpusFrom(0, 40), cpusFrom(40, 40)}, false)
+	io0 := &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40},
+		idle: true, rejectStop: true}
+	io1 := &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40}}
+	a, _ := NewPolicyEngine(io0, topo.CPUs[0], eevdf.Enums{})
+	b, _ := NewPolicyEngine(io1, topo.CPUs[1], eevdf.Enums{})
+	c, _ := New(topo, []Engine{a, b})
+	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23, Cpu: 0, Weight: 100, EnqSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	io0.curr = 23
+	if err := c.StopFor(0, 23, 40); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if owner, ok := c.Owner(23, 23); !ok || owner != 0 || len(io0.commands) != 1 {
+		t.Fatal("failed STOP changed owner or submitted a command")
+	}
+	if err := c.StopFor(40, 23, 0); err == nil {
+		t.Fatal("accepted a stop from nonowner CPU")
+	}
+	io0.rejectStop = false
+	if err := c.StopFor(0, 23, 40); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvExit, Pid: 23, Cpu: 0}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c) // old STOP message is followed by exit
+	if _, ok := c.Owner(23, 23); ok {
+		t.Fatal("exit retained ownership")
+	}
+	if len(io0.commands) != 2 {
+		t.Fatalf("unexpected STOP submissions: %+v", io0.commands)
+	}
+}
+
+func TestActiveStopRechecksAffinityAtAcknowledgement(t *testing.T) {
+	topo, _ := NewTopology(80, [][]int32{cpusFrom(0, 40), cpusFrom(40, 40)}, false)
+	io0 := &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40}, idle: true}
+	io1 := &shardPolicyIO{queued: make(map[int32]uint64), allowed: []int32{0, 40}, idle: true}
+	a, _ := NewPolicyEngine(io0, topo.CPUs[0], eevdf.Enums{})
+	b, _ := NewPolicyEngine(io1, topo.CPUs[1], eevdf.Enums{})
+	c, _ := New(topo, []Engine{a, b})
+	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23, Cpu: 0, Weight: 100, EnqSeq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	io0.curr = 23
+	if err := c.StopFor(0, 23, 40); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	io0.allowed = []int32{0}
+	if err := c.Route(23, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 23, Cpu: 0, Weight: 100, EnqSeq: 2}); err != nil {
+		t.Fatal(err)
+	}
+	stepAll(t, c)
+	if owner, ok := c.Owner(23, 23); !ok || owner != 0 || len(io1.commands) != 0 {
+		t.Fatalf("revoked destination acquired task: owner %d, registered %v, commands %+v", owner, ok, io1.commands)
 	}
 }
 

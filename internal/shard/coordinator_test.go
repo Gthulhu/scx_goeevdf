@@ -23,6 +23,61 @@ type fakeEngine struct {
 	ticks      chan uint64
 }
 
+type blockingStopTarget struct {
+	*fakeEngine
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingStopTarget) StopTarget(int32, int32, uint64) (int32, bool, bool) {
+	close(e.entered)
+	<-e.release
+	return 0, false, false
+}
+
+func TestStopTargetDoesNotHoldCoordinatorLock(t *testing.T) {
+	c, engines := fixture(t, 4)
+	stop := &blockingStopTarget{fakeEngine: engines[0],
+		entered: make(chan struct{}), release: make(chan struct{})}
+	c.workers[0].engine = stop
+	if err := c.Route(8, eevdf.Event{Kind: eevdf.EvEnqueue, Pid: 8, Cpu: 0}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := c.Step(0); done <- err }()
+	select {
+	case <-stop.entered:
+	case <-time.After(5 * time.Second):
+		close(stop.release)
+		t.Fatal("StopTarget was not invoked")
+	}
+	route := make(chan error, 1)
+	go func() {
+		if _, ok := c.Owner(8, 8); !ok {
+			route <- fmt.Errorf("lost owner during StopTarget")
+			return
+		}
+		route <- c.Route(8, eevdf.Event{Kind: eevdf.EvYield, Pid: 8, Cpu: 0})
+	}()
+	select {
+	case err := <-route:
+		if err != nil {
+			close(stop.release)
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		close(stop.release)
+		t.Fatal("StopTarget held coordinator lock across affinity I/O")
+	}
+	close(stop.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(engines[0].handled, []int32{8, 8}) {
+		t.Fatalf("later event overtook pending STOP check: %v", engines[0].handled)
+	}
+}
+
 func (f *fakeEngine) Handle(slot int32, ev eevdf.Event) error {
 	f.handled = append(f.handled, ev.Pid)
 	if ev.Kind == eevdf.EvExit {
@@ -370,8 +425,8 @@ func TestStealAndMisroutedEvents(t *testing.T) {
 	if owner, ok := c.Owner(11, 11); !ok || owner != 2 || len(f[0].handled) != 2 {
 		t.Fatalf("steal/misrouting failed: %d %v %v", owner, ok, f[0].handled)
 	}
-	if err := c.StopFor(0, 11, 41); err != nil {
-		t.Fatal(err)
+	if err := c.StopFor(0, 11, 41); err == nil {
+		t.Fatal("stale source was allowed to stop a task owned by another shard")
 	}
 	if err := c.Steal(0, 1, 0); err == nil {
 		t.Fatal("local steal accepted")

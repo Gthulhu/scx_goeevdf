@@ -64,12 +64,16 @@ func (e *PolicyEngine) Steal(from, dst int32, level int) (int32, int32, bool, er
 }
 
 func (e *PolicyEngine) StopFor(cpu, pid, dst int32) error {
-	return ErrActiveStopUnsupported
+	return e.Shard.StopFor(cpu, pid, dst)
 }
 
-// SupportsStopFor remains false until the BPF transport can acknowledge that
-// the task is no longer running and the source Policy has queued it for export.
-func (e *PolicyEngine) SupportsStopFor() bool { return false }
+func (e *PolicyEngine) SupportsStopFor() bool { return true }
+
+func (e *PolicyEngine) StopTarget(pid, slot int32, seq uint64) (int32, bool, bool) {
+	return e.Shard.StopTarget(pid, slot, seq)
+}
+
+func (e *PolicyEngine) ClearStop(pid int32) { e.Shard.ClearStop(pid) }
 
 func (e *PolicyEngine) Tick() error {
 	e.Shard.Tick()
