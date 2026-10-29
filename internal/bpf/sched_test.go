@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -80,6 +81,9 @@ func TestOpenAndSetTgid(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
+	if err := s.WaitShard(0); err != syscall.EINVAL {
+		t.Fatalf("unloaded ring wait: %v", err)
+	}
 	if err := s.SetUserschedTgid(uint32(os.Getpid())); err != nil {
 		t.Fatal(err)
 	}
@@ -103,6 +107,15 @@ func TestOpenAndSetTgid(t *testing.T) {
 	}
 	if got := s.mapTable("missing"); got != -int(syscall.ENOENT) {
 		t.Fatalf("missing map fd = %d", got)
+	}
+}
+
+func TestWaitShardInvalid(t *testing.T) {
+	s := &Sched{nrShards: 1}
+	for _, id := range []int{-1, 0, 1} {
+		if err := s.WaitShard(id); err != syscall.EINVAL {
+			t.Fatalf("wait on unavailable shard %d: %v", id, err)
+		}
 	}
 }
 
@@ -139,6 +152,13 @@ func TestPrivilegedLoad(t *testing.T) {
 	if ok, err := s.Consume(&ev); ok || err != nil {
 		t.Fatalf("unexpected event: ok=%v err=%v", ok, err)
 	}
+	start := time.Now()
+	if err := s.WaitShard(0); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("empty ring wait blocked for %s", elapsed)
+	}
 	s.SetNrScheduled(42)
 	if got := s.Counter("nr_scheduled"); got != 42 {
 		t.Fatalf("scheduled count = %d, want 42", got)
@@ -151,6 +171,15 @@ func TestPrivilegedLoad(t *testing.T) {
 	}
 	if got := s.Counter("nr_queued"); got != events {
 		t.Fatalf("queued count before consume = %d, want %d", got, events)
+	}
+	start = time.Now()
+	for i := 0; i < 100; i++ {
+		if err := s.WaitShard(0); err != nil {
+			t.Fatalf("wait on already queued events: %v", err)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Fatalf("ready ring repeatedly timed out instead of waking: %s", elapsed)
 	}
 	for seq := uint64(1); seq <= events; seq++ {
 		var got Ev
@@ -165,6 +194,34 @@ func TestPrivilegedLoad(t *testing.T) {
 	}
 	if ok, err := s.Consume(&ev); ok || err != nil {
 		t.Fatalf("extra event: ok=%v err=%v", ok, err)
+	}
+	emitted := make(chan error, 1)
+	go func() {
+		time.Sleep(5 * time.Millisecond)
+		emitted <- s.testEmit(0, 99)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := s.WaitShard(0); err != nil {
+			t.Fatal(err)
+		}
+		ok, err := s.Consume(&ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			if ev.EnqSeq != 99 {
+				t.Fatalf("wait consumed or reordered event: %+v", ev)
+			}
+			s.DecNrQueued(1)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("delayed event did not wake consumer")
+		}
+	}
+	if err := <-emitted; err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -115,11 +115,18 @@ This generates `bpf/vmlinux.h` from the running kernel BTF, compiles `bpf/goeevd
 go test ./...
 go test -race ./...
 python3 scripts/test_bpf_progress.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_fairness.py'
 
 # Disposable VM only: privileged load, attach, fairness and detach
 go test -c -o bin/bpf-load.test ./internal/bpf
 sudo sh scripts/test_vm.sh /boot/vmlinuz-6.14.0-37-generic
 ```
+
+The VM smoke compares built-in EEVDF and `scx_goeevdf` using nice 0/6 workers
+on the same CPU. Each worker acknowledges its actual nice value and CPU affinity
+**after initialization**, before warmup and the six-second measurement. A fixed
+startup sleep alone is insufficient on a slow VM. The ratio threshold remains
+2.5–5.0; see [ALIGNMENT.md](./ALIGNMENT.md) for measurements and remaining T4 work.
 
 ### Run the Scheduler
 
@@ -136,6 +143,9 @@ sudo sh -c 'ulimit -l unlimited; exec ./bin/goeevdf'
 ```text
   -bpf-object string
         compiled sched_ext BPF object (default "bpf/goeevdf.bpf.o")
+  -trace-file string
+        diagnostic JSONL events, successful commands and task publications
+        (new file only; disabled by default; adds scheduling overhead)
   -shards string
         per-LLC sharding above 64 possible CPUs: "auto" or "1" (default "auto")
   -no-wakeup-preempt
@@ -183,6 +193,37 @@ sudo sh -c 'ulimit -l unlimited; exec ./bin/goeevdf'
 ```
 
 ---
+
+### Runtime Diagnostics
+
+Inside a test VM, use `-trace-file /tmp/goeevdf.jsonl` to correlate BPF events
+(`SumExec`, `Weight`, enqueue sequence), submitted commands (`Slice`), and Go
+task publications (`Vruntime`, `Deadline`, effective `Weight`). Each JSONL
+record has a monotonic nanosecond `time` and one of `event`, `command`, or `task`.
+Both single-loop and sharded runtimes support tracing. Output is mode 0600,
+existing files are never overwritten, and write/flush failures are reported.
+The file is flushed on normal signal shutdown. Tracing is for diagnosis, not
+performance comparisons or a stable monitor ABI.
+
+### Wake-Latency Validation
+
+`schtest adaptive_priority` measures p90 fast/slow semaphore wake latency;
+it requires a ratio below 0.50, independently of CPU-time fairness. This gate
+is **not yet passing reliably**; see [ALIGNMENT.md](./ALIGNMENT.md).
+
+Inside a marked disposable VM (`goeevdf_test_vm=1` on its kernel command line),
+run `sh scripts/vm_adaptive.sh /path/to/schtest`. It runs the built-in baseline
+and three independent scheduler attachments, preserves the benchmark's threshold,
+and returns failure if any run fails. Use a schtest build compatible with the
+guest's cgroup version: builds that open cgroup-v1 `tasks` fail to start children
+on cgroup v2, before measuring scheduling latency. Allow at least 420 seconds
+for an outer VM timeout.
+
+Both Go event loops now wait for ring readiness rather than sleeping after an
+empty batch, with a 1 ms timeout for periodic work and shutdown. Enqueue event
+publication no longer unconditionally preempts the workload CPU; Go decides
+wake preemption. These corrections alone do not establish adaptive-priority
+acceptance. Disable diagnostic tracing for performance measurements.
 
 ## Re-rendering the Manim Diagrams
 

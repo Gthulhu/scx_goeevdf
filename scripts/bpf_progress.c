@@ -133,6 +133,7 @@ static void test_enqueue(void)
 	assert_enqueue_order = true;
 	expected_queued = 1;
 	ge_enqueue(&task, SCX_ENQ_WAKEUP);
+	assert(kicks == 0); /* Wake preemption belongs to Go, not event publication. */
 	assert(last_event.kind == EV_ENQUEUE && last_event.now == mock_now);
 	assert(last_event.pid == 42 && last_event.tgid == 40 && last_event.cpu == 0);
 	assert(last_event.weight == 123 && last_event.sum_exec == 456 && last_event.policy == 3);
@@ -142,6 +143,7 @@ static void test_enqueue(void)
 	assert(!context.selected && context.waiting);
 	expected_queued = 2;
 	ge_enqueue(&task, 0);
+	assert(kicks == 0);
 	assert(last_event.enq_seq == 2 && !last_event.wake_flags && !last_event.waker_pid);
 	ring_full = true;
 	ge_enqueue(&task, 0);

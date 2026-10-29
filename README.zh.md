@@ -113,11 +113,17 @@ make build
 go test ./...
 go test -race ./...
 python3 scripts/test_bpf_progress.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p 'test_fairness.py'
 
 # 僅於獨立 VM 驗證載入、attach、公平性與 detach
 go test -c -o bin/bpf-load.test ./internal/bpf
 sudo sh scripts/test_vm.sh /boot/vmlinuz-6.14.0-37-generic
 ```
+
+VM smoke 會比較內建 EEVDF 與 `scx_goeevdf`，將 nice 0／6 worker 綁於同一 CPU。
+兩個 worker 都必須在**初始化完成後**回報實際 nice 與 affinity，才開始暖機及六秒量測；
+慢速 VM 中只固定等待啟動秒數並不可靠。比值門檻維持 2.5–5.0；
+量測結果與其他 T4 待辦見 [ALIGNMENT.md](./ALIGNMENT.md)。
 
 ### 啟動排程器
 
@@ -133,6 +139,9 @@ sudo sh -c 'ulimit -l unlimited; exec ./bin/goeevdf'
 ```text
   -bpf-object string
         指定編譯好的 sched_ext BPF 物件檔路徑 (預設 "bpf/goeevdf.bpf.o")
+  -trace-file string
+        診斷用 JSONL：BPF 事件、成功送出的指令與任務發布資訊
+        （僅建立新檔、預設停用，會增加排程開銷）
   -shards string
         超過 64 顆可能 CPU 時的 per-LLC 分片模式："auto" 或 "1" (預設 "auto")
   -no-wakeup-preempt
@@ -180,6 +189,32 @@ sudo sh -c 'ulimit -l unlimited; exec ./bin/goeevdf'
 ```
 
 ---
+
+### 執行期診斷
+
+在測試 VM 中以 `-trace-file /tmp/goeevdf.jsonl` 關聯 BPF 事件
+（`SumExec`、`Weight`、enqueue sequence）、派發指令（`Slice`）與 Go 任務發布
+（`Vruntime`、`Deadline`、有效 `Weight`）。每筆 JSONL 包含 monotonic 奈秒
+`time`，以及 `event`、`command`、`task` 其中之一，單迴圈與分片模式皆支援。
+輸出權限為 0600、不覆寫既有檔案，寫入／flush 失敗會回報；正常訊號關閉時完成 flush。
+此功能供診斷使用，不適合效能比較，也不是穩定的監控 ABI。
+
+### 喚醒延遲驗證
+
+`schtest adaptive_priority` 比較 fast／slow semaphore 的 p90 喚醒延遲，
+要求比值 `< 0.50`，與 CPU-time 公平性是不同門檻。目前**尚未穩定通過**，
+詳細結果見 [ALIGNMENT.md](./ALIGNMENT.md)。
+
+於核心命令列含 `goeevdf_test_vm=1` 的獨立 VM 中執行
+`sh scripts/vm_adaptive.sh /path/to/schtest`，會測試內建 baseline 及三次獨立
+掛載排程器，不調降 benchmark 門檻，任一次失敗即回傳失敗。請使用相容於
+guest cgroup 版本的 schtest：開啟 cgroup-v1 `tasks` 的版本在 cgroup v2
+會無法啟動子程序，尚未進入排程延遲測量。外層 VM timeout 請至少保留 420 秒。
+
+兩個 Go 事件迴圈目前改為等待 ring 就緒，不再於空批次後固定睡眠，
+並保留 1 ms timeout 以處理週期工作與關閉訊號。發布 enqueue 事件也不再
+無條件搶佔 workload CPU，而由 Go 決定 wake preemption；這兩項修正本身
+不代表已通過 adaptive-priority 驗收。效能測量時請停用 trace。
 
 ## 重新渲染 Manim 架構圖與動畫
 

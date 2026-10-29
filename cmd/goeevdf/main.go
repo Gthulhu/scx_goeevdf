@@ -12,7 +12,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/Gthulhu/scx_goeevdf/eevdf"
@@ -22,6 +21,7 @@ import (
 type backend struct {
 	sched    *bpf.Sched
 	pressure *eevdf.Pressure
+	trace    *runtimeTrace
 }
 
 func (b backend) Submit(c eevdf.Cmd) error {
@@ -30,7 +30,11 @@ func (b backend) Submit(c eevdf.Cmd) error {
 		Slice: c.Slice, EnqFlags: c.EnqFlags, EnqSeq: c.EnqSeq,
 		Slot: c.Slot, ExpectCurr: c.ExpectCurr, KickFlags: c.KickFlags,
 	}
-	return b.sched.Submit(&cmd)
+	err := b.sched.Submit(&cmd)
+	if err == nil && b.trace != nil {
+		b.trace.record(traceRecord{Time: clockNow(), Command: &c})
+	}
+	return err
 }
 
 func (b backend) Idle(cpu int32) bool {
@@ -50,6 +54,9 @@ func (b backend) RunStart(cpu int32) uint64 {
 }
 
 func (b backend) Publish(slot uint32, value eevdf.TaskPub) {
+	if b.trace != nil {
+		b.trace.record(traceRecord{Time: clockNow(), Task: &value})
+	}
 	b.sched.Publish(slot, bpf.TaskPub{
 		Pid: value.Pid, CoreVtime: value.CoreVtime,
 		Vruntime: value.Vruntime, Deadline: value.Deadline,
@@ -133,7 +140,7 @@ func updateFrequency(p *eevdf.Policy, gov *eevdf.FrequencyGovernor, io perfIO, n
 	}
 }
 
-func run(ctx context.Context, object string, features eevdf.Features) error {
+func run(ctx context.Context, object string, features eevdf.Features, trace *runtimeTrace) error {
 	enums, features, err := runtimeEnums(features)
 	if err != nil {
 		return err
@@ -171,7 +178,7 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 		return err
 	}
 	pressure := eevdf.NewPressure(ncpu)
-	io := backend{sched: s, pressure: pressure}
+	io := backend{sched: s, pressure: pressure, trace: trace}
 	p := eevdf.New(io, ncpu, policyEnums(enums))
 	p.F = features
 	p.F.Normalize()
@@ -200,6 +207,9 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 			}
 			if !ok {
 				break
+			}
+			if trace != nil {
+				trace.record(traceRecord{Time: clockNow(), Event: &ev})
 			}
 			gc.observe(ev)
 			if ev.Kind == eevdf.EvEnqueue {
@@ -236,6 +246,9 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 			updateFrequency(p, governor, io, clockNow(), ncpu, attached)
 		}
 		if now := clockNow(); now >= nextTick {
+			if err := trace.check(); err != nil {
+				return fmt.Errorf("scheduler trace: %w", err)
+			}
 			if kind := s.Counter("exit_kind"); kind != 0 {
 				return fmt.Errorf("kernel scheduler exited: kind=%d code=%d", kind, int64(s.Counter("exit_code")))
 			}
@@ -282,13 +295,16 @@ func run(ctx context.Context, object string, features eevdf.Features) error {
 			s.SetNrScheduled(0)
 		}
 		if count == 0 {
-			time.Sleep(100 * time.Microsecond)
+			if err := s.WaitShard(0); err != nil {
+				return fmt.Errorf("wait for scheduler events: %w", err)
+			}
 		}
 	}
 	return nil
 }
 
 func main() {
+	tracePath := flag.String("trace-file", "", "write diagnostic JSONL events/commands/publications to a new file (adds overhead)")
 	object := flag.String("bpf-object", "bpf/goeevdf.bpf.o", "compiled sched_ext BPF object")
 	shards := flag.String("shards", "auto", "per-LLC sharding above 64 possible CPUs (auto or 1)")
 	noWakePreempt := flag.Bool("no-wakeup-preempt", false, "disable wakeup preemption")
@@ -313,6 +329,11 @@ func main() {
 	disableCPUQuota := flag.Bool("disable-cpu-max", false, "disable cpu.max enforcement")
 	disableCpufreq := flag.Bool("disable-cpufreq", false, "disable CPU performance updates")
 	flag.Parse()
+	trace, err := openTrace(*tracePath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "goeevdf: trace:", err)
+		os.Exit(1)
+	}
 	features := eevdf.DefaultFeatures()
 	features.WakeupPreempt = !*noWakePreempt
 	features.Eligibility = !*noEligibility
@@ -336,6 +357,9 @@ func main() {
 	features.CpuMax = !*disableCPUQuota
 	features.Cpufreq = !*disableCpufreq
 	if err := prepareRuntime(); err != nil {
+		if closeErr := trace.close(); closeErr != nil {
+			fmt.Fprintln(os.Stderr, "goeevdf:", closeErr)
+		}
 		fmt.Fprintln(os.Stderr, "goeevdf:", err)
 		os.Exit(1)
 	}
@@ -348,13 +372,17 @@ func main() {
 		groups, err = selectShardGroups(ncpu, topo, *shards)
 		if err == nil {
 			if groups == nil {
-				err = run(ctx, *object, features)
+				err = run(ctx, *object, features, trace)
 			} else {
-				err = runSharded(ctx, *object, features, topo, groups)
+				err = runSharded(ctx, *object, features, topo, groups, trace)
 			}
 		}
 	}
-	if err != nil && !errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) {
+		err = nil
+	}
+	err = errors.Join(err, trace.close())
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "goeevdf:", err)
 		os.Exit(1)
 	}

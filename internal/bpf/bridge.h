@@ -23,6 +23,7 @@ int ge_bss_size(struct ge_handle *);
 int ge_consume(struct ge_handle *, struct ev *);
 int ge_submit(struct ge_handle *, const struct cmd *);
 int ge_consume_shard(struct ge_handle *, uint32_t, struct ev *);
+int ge_wait_shard(struct ge_handle *, uint32_t);
 int ge_submit_shard(struct ge_handle *, uint32_t, const struct cmd *);
 int ge_kick(struct ge_handle *, int32_t, uint64_t);
 int ge_hrtick(struct ge_handle *, int32_t, uint32_t, uint64_t);

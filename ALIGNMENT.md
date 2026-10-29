@@ -115,6 +115,9 @@ Do not change scheduling semantics merely to make an existing test pass.
 - Implemented: effective `-no-vref-update`, `-no-wake-sync`, `-no-wa-weight`;
   corrected bilingual compatibility/completeness/transport documentation and
   re-rendered Manim PNG/GIF from the corrected source.
+- Added opt-in `-trace-file` JSONL diagnostics for events, successful commands
+  and task publications in both runtime modes. Concurrent schema and I/O-error
+  tests pass. This adds overhead and is not the planned immutable stats/monitor.
 - Remaining: numeric/topology options, CLI parsing tests, immutable JSON
   statistics, loop/GC latency and mmap monitor transport.
 
@@ -133,6 +136,9 @@ Do not change scheduling semantics merely to make an existing test pass.
   dispatch queues, expiry/preemption, run-sequence timers and periodic policy
   callbacks. Tests assert nice 0 vs -5 ratio 3121/1024 within 5%, four-CPU
   cgroup/quota thresholds, service conservation and repeatability.
+  The matching VM nice 0/6 case now also runs on an eight-CPU topology with
+  both tasks restricted to CPU0, using the observed sched_ext weight 27 and
+  requiring the standard 272/1024 service ratio within 5%.
 - Callback harness compiles actual source bodies for enqueue fields and
   backlog-before-publication, congestion fallback, dispatch guards,
   continuation, hrtick, heartbeat, seqcount/PID/FIFO fallback and displacement.
@@ -143,7 +149,7 @@ Do not change scheduling semantics merely to make an existing test pass.
   injection and all remaining T2 topology/latency/feature scenarios.
   The slice model is not a full kernel callback-ordering emulator.
 
-### A8. VM acceptance and performance — in progress; fairness acceptance failing
+### A8. VM acceptance and performance — in progress; smoke/fairness slice verified
 
 - Scope: `scripts/` disposable-VM test entry points and recorded results.
 - Run T4 smoke/fairness/yield/churn/cgroup/pressure/hrtick/core-scheduling and
@@ -157,23 +163,79 @@ Do not change scheduling semantics merely to make an existing test pass.
 - Implemented: marked-guest-only smoke entry points using a read-only host
   root, privileged load tests, bounded attachment readiness, weighted CPU-time
   sampling, signal cleanup and normal-path detach verification.
-- Load tests and attachment pass on `6.14.0-37-generic`, 8 CPUs / 4GiB.
-  An earlier smoke recorded nice 0/6 ratio 2.667 and successful detach.
-  **This is not stable acceptance:** a default run measured 2.047
+- Historical failure on `6.14.0-37-generic`, 8 CPUs / 4GiB:
+  an earlier smoke recorded nice 0/6 ratio 2.667 and successful detach,
+  but a later default run measured 2.047
   (`[307,150]` ticks), below the required [2.5,5.0]. Disabling VrefUpdate also
   failed at 2.403 (`[334,139]`), so projection alone does not explain the gap.
   After the local-DSQ continuation guard, load/attach still pass but fairness
   remains below threshold at 2.317 (`[336,145]`).
-  Do not lower the threshold or call A8 verified; diagnose real-kernel runtime
-  accounting/timer/dispatch behavior before extending the acceptance matrix.
-- Remaining: stable smoke, every other T4 row, built-in EEVDF comparison,
+- Root cause identified on 2026-10-29: the benchmark sampled one second after
+  process creation, not after worker initialization. Runtime traces showed the
+  intended nice-6 worker still reporting weight 100 through startup/import
+  events, then switching to 27 only after `os.nice(6)`. Thus the measurement
+  included work before the intended priority and CPU-bound loop were active.
+  This was a benchmark synchronization error, not evidence that the weighted
+  policy itself required a fairness correction.
+- Fix: both workers acknowledge PID, actual nice and affinity after setup;
+  warmup and sampling begin only after both acknowledgements. Missing, invalid
+  or timed-out readiness fails explicitly. Six unprivileged regression tests
+  cover delayed startup, real nice/affinity, invalid readiness, EOF, timeout
+  and no sampling on a failed barrier. The original [2.5,5.0] bound is unchanged.
+- Verification, same kernel / 8 CPUs / 4GiB / six-second measurement, tracing
+  disabled: built-in EEVDF 3.762 (`[474,126]` ticks); three consecutive
+  attach/fairness/detach runs 3.690 (`[417,113]`), 3.754 (`[428,114]`),
+  3.711 (`[423,114]`). A separate post-fix run measured 3.701 (`[433,117]`).
+  The updated documented VM entry point (including the built-in baseline)
+  also passes at 3.737 (`[426,114]`) with successful signal detach.
+  Runtime tracing with readiness also measured 410/110 = 3.727, but diagnostic
+  tracing perturbs timing and is not used as performance acceptance.
+- The VM smoke now records kernel/CPU metadata and tests the built-in baseline
+  before attaching the experimental scheduler.
+- Adaptive wake-latency gate remains **failing**, independently of CPU fairness.
+  `schtest` revision `ae6450add75784793c691207ae1bc1df1bf9edee`
+  measures p90 fast/slow semaphore wake latency on one CPU, with an unchanged
+  `<0.50` threshold. The actual fast workload spins for 100 us and sleeps
+  9.9 ms; the slow workload spins for 10 ms.
+  The local benchmark used cgroup-v1 `tasks`; a session-local source copy
+  changed only cgroup membership/cleanup accesses to `cgroup.procs` for the
+  cgroup-v2 VM. Workload, statistics and threshold were not modified.
+- Corrected two wake-path problems: both runtime loops now wait on ring epoll
+  readiness instead of an uninterruptible 100 us sleep, with a 1 ms timeout
+  for periodic work/mailboxes/shutdown; normal BPF enqueue no longer issues
+  an unconditional PREEMPT kick before Go's wake-preemption decision.
+  Privileged tests cover empty timeout, already-ready repeated waits,
+  non-consuming waits and delayed delivery. The actual-source callback
+  harness asserts enqueue publication does not preempt.
+- Reproducible entry point: `scripts/vm_adaptive.sh /path/to/schtest` inside
+  a marked disposable VM. It runs built-in EEVDF and three independent
+  attach/test/detach attempts, propagating any benchmark failure.
+  Final untraced run, `6.14.0-37-generic`, 8 CPUs / 4GiB:
+  built-in EEVDF **0.78**; scheduler **0.88 / 0.84 / 0.77**. All failed.
+  Earlier scheduler measurements before the wake-path changes included 1.33;
+  VM variability and a failing built-in baseline prevent attributing an
+  end-to-end improvement to these changes alone.
+  The post-change CPU-fairness smoke still passes: built-in 3.762
+  (`[474,126]` ticks), scheduler 3.733 (`[448,120]`), normal detach.
+- Next adaptive-priority work: correlate actual sched_switch timestamps with
+  wake events and command execution, separate transport delay from policy
+  deferral, and repeat the unchanged gate on a quiet VM with a stable built-in
+  baseline. A diagnostic trace already shows substantial enqueue-to-command
+  delay, but tracing itself perturbs latency; it is not acceptance evidence.
+  Do not add arbitrary sleeper bonuses or relax the benchmark to hide the gap.
+- Remaining: every other T4 row, broader built-in EEVDF performance comparison,
   64+CPU sharded workloads and long-run/performance measurements.
+  Smoke/fairness passing on this kernel does not verify all of A8.
 
 ## Current validation baseline
 
 - `make build`, `go test ./...`, `go test -race ./...`, `go vet ./...`,
   `python3 scripts/test_bpf_progress.py`, and `git diff --check` pass.
 - Privileged BPF load/optional-op/shard-load tests pass in the disposable VM.
-  Current weighted-fairness acceptance fails as documented under A8.
+  Worker-readiness regression tests and the corrected VM weighted-fairness
+  smoke pass as documented under A8; the full T4 matrix remains incomplete.
+- `sh -n scripts/vm_adaptive.sh` and its shared-host rejection guard pass.
+  Its actual VM baseline and three scheduler runs correctly return failure;
+  adaptive wake-latency acceptance is explicitly unresolved.
 - Keep A1–A8 distinct from the original plan's similarly named task IDs.
   READMEs and Manim diagrams describe architecture, not proof of full parity.

@@ -6,13 +6,33 @@ import (
 )
 
 func TestWeightedServiceThreshold(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		cpus   int
+		weight uint64
+		want   float64
+	}{
+		{"nice_minus5", 1, 305, 3121.0 / 1024},
+		{"vm_nice6", 8, 27, 272.0 / 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testWeightedService(t, tc.cpus, tc.weight, tc.want)
+		})
+	}
+}
+
+func testWeightedService(t *testing.T, cpus int, weight uint64, want float64) {
+	t.Helper()
 	var first [2]uint64
 	for attempt := 0; attempt < 2; attempt++ {
-		s, err := New(1)
+		s, err := New(cpus)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, task := range []Task{{PID: 1, Weight: 100}, {PID: 2, Weight: 305}} {
+		for _, task := range []Task{
+			{PID: 1, Weight: 100, Allowed: []int32{0}},
+			{PID: 2, Weight: weight, Allowed: []int32{0}},
+		} {
 			if err := s.Add(task, 0); err != nil {
 				t.Fatal(err)
 			}
@@ -21,7 +41,6 @@ func TestWeightedServiceThreshold(t *testing.T) {
 			t.Fatal(err)
 		}
 		ratio := float64(s.Tasks[2].Runtime) / float64(s.Tasks[1].Runtime)
-		want := 3121.0 / 1024
 		if math.Abs(ratio/want-1) > 0.05 {
 			t.Fatalf("weighted service %.4f, want %.4f ±5%%", ratio, want)
 		}

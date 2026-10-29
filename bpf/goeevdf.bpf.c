@@ -251,7 +251,6 @@ void BPF_STRUCT_OPS(ge_enqueue, struct task_struct *p, u64 flags)
 	__sync_fetch_and_add(&nr_queued, 1);
 	__sync_fetch_and_add(&nr_queued_s[shard_for_cpu(scx_bpf_task_cpu(p))], 1);
 	bpf_ringbuf_submit(e, 0);
-	scx_bpf_kick_cpu(scx_bpf_task_cpu(p), SCX_KICK_PREEMPT);
 }
 
 static __always_inline void do_dispatch(const struct cmd *c, u32 owner)

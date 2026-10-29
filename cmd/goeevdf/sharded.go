@@ -26,11 +26,15 @@ type shardBackend struct {
 }
 
 func (b shardBackend) Submit(c eevdf.Cmd) error {
-	return b.sched.SubmitShard(b.id, &bpf.Cmd{
+	err := b.sched.SubmitShard(b.id, &bpf.Cmd{
 		Kind: c.Kind, Pid: c.Pid, Cpu: c.Cpu, Cflags: c.Cflags,
 		Slice: c.Slice, EnqFlags: c.EnqFlags, EnqSeq: c.EnqSeq,
 		Slot: c.Slot, ExpectCurr: c.ExpectCurr, KickFlags: c.KickFlags,
 	})
+	if err == nil && b.trace != nil {
+		b.trace.record(traceRecord{Time: clockNow(), Command: &c})
+	}
+	return err
 }
 
 func shardCPUs(groups [][]int32, possible int) ([]uint32, error) {
@@ -578,7 +582,7 @@ func pullRemote(c *shard.Coordinator, topo eevdf.Topology, id int, idle func(int
 	return -1, nil
 }
 
-func shardWorker(ctx context.Context, s *bpf.Sched, c *shard.Coordinator, broadcaster *groupBroadcaster, id int,
+func shardWorker(ctx context.Context, s *bpf.Sched, c *shard.Coordinator, broadcaster *groupBroadcaster, trace *runtimeTrace, id int,
 	cpu int32, topo eevdf.Topology, ready chan<- error, start <-chan struct{}) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -613,6 +617,9 @@ func shardWorker(ctx context.Context, s *bpf.Sched, c *shard.Coordinator, broadc
 			}
 			if !ok {
 				break
+			}
+			if trace != nil {
+				trace.record(traceRecord{Time: clockNow(), Event: &ev})
 			}
 			gc.observe(ev)
 			if ev.Kind == bpf.EvCgrpExit || ev.Kind == bpf.EvCgrpWeight ||
@@ -664,6 +671,9 @@ func shardWorker(ctx context.Context, s *bpf.Sched, c *shard.Coordinator, broadc
 			}
 		}
 		if now := clockNow(); now >= nextPull {
+			if err := trace.check(); err != nil {
+				return fmt.Errorf("scheduler trace: %w", err)
+			}
 			if kind := s.Counter("exit_kind"); kind != 0 {
 				return fmt.Errorf("kernel scheduler exited: kind=%d code=%d", kind, int64(s.Counter("exit_code")))
 			}
@@ -693,7 +703,9 @@ func shardWorker(ctx context.Context, s *bpf.Sched, c *shard.Coordinator, broadc
 			nextPull = now + 10_000_000
 		}
 		if count == 0 {
-			time.Sleep(100 * time.Microsecond)
+			if err := s.WaitShard(id); err != nil {
+				return fmt.Errorf("shard %d wait for events: %w", id, err)
+			}
 		}
 	}
 	return nil
@@ -704,7 +716,7 @@ func shardWorker(ctx context.Context, s *bpf.Sched, c *shard.Coordinator, broadc
 // Startup cpu.max budgets are shared across owners. Runtime quota changes
 // still stop rather than applying a partially installed limit.
 func runSharded(ctx context.Context, object string, features eevdf.Features,
-	topo eevdf.Topology, groups [][]int32) error {
+	topo eevdf.Topology, groups [][]int32, trace *runtimeTrace) error {
 	enums, features, err := runtimeEnums(features)
 	if err != nil {
 		return err
@@ -730,7 +742,7 @@ func runSharded(ctx context.Context, object string, features eevdf.Features,
 	if len(groups) > 1 {
 		quotaSnapshot, err = readShardQuotaSnapshot("/sys/fs/cgroup")
 		if err != nil {
-			return run(ctx, object, features)
+			return run(ctx, object, features, trace)
 		}
 		quotaPool = eevdf.NewSharedQuotaPool()
 		for id, config := range quotaSnapshot.groups {
@@ -779,7 +791,7 @@ func runSharded(ctx context.Context, object string, features eevdf.Features,
 			return err
 		}
 		pressure := eevdf.NewPressure(ncpu)
-		io := shardBackend{backend{sched: s, pressure: pressure}, id}
+		io := shardBackend{backend{sched: s, pressure: pressure, trace: trace}, id}
 		var adapter *shard.PolicyEngine
 		if quotaPool != nil {
 			adapter, err = shard.NewPolicyEngineWithQuota(io, cpus, policyEnums(enums), quotaPool)
@@ -826,7 +838,7 @@ func runSharded(ctx context.Context, object string, features eevdf.Features,
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			results <- shardWorker(runCtx, s, c, broadcaster, id, pinned[id], topo, ready, start)
+			results <- shardWorker(runCtx, s, c, broadcaster, trace, id, pinned[id], topo, ready, start)
 		}(id)
 	}
 	defer func() {

@@ -7,7 +7,11 @@ if ! grep -q 'goeevdf_test_vm=1' /proc/cmdline; then
 fi
 
 ulimit -l unlimited
+test "$(cat /sys/kernel/sched_ext/state)" = disabled
+echo "Kernel: $(uname -r); CPUs: $(getconf _NPROCESSORS_ONLN)"
 (cd internal/bpf && GOEEVDF_TEST_BPF_LOAD=1 ../../bin/bpf-load.test -test.v)
+echo "Built-in EEVDF fairness baseline"
+python3 scripts/fairness.py
 log=$(mktemp /tmp/goeevdf-smoke.XXXXXX)
 scheduler=
 cleanup() {
@@ -37,6 +41,7 @@ while [ "$(cat /sys/kernel/sched_ext/state)" != enabled ]; do
 	sleep 0.1
 done
 kill -0 "$scheduler"
+echo "scx_goeevdf fairness (after worker readiness)"
 python3 scripts/fairness.py
 kill -TERM "$scheduler"
 wait "$scheduler"

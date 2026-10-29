@@ -241,6 +241,21 @@ func (s *Sched) KickIdle(cpu int32) error {
 	return s.Kick(cpu, s.kickIdle)
 }
 
+// WaitShard waits for ring readiness without consuming events. A one-millisecond
+// timeout bounds periodic work, mailbox processing and signal shutdown latency.
+// Call only from the shard's owner, after draining its ring.
+func (s *Sched) WaitShard(id int) error {
+	if id < 0 || id >= s.nrShards || s.handle == nil {
+		return syscall.EINVAL
+	}
+	err := check(C.ge_wait_shard(s.handle, C.uint32_t(id)))
+	runtime.KeepAlive(s)
+	if errors.Is(err, syscall.EINTR) {
+		return nil
+	}
+	return err
+}
+
 // Kick executes a BPF syscall program to force a target CPU's dispatch callback.
 func (s *Sched) Kick(cpu int32, flags uint64) error {
 	return check(C.ge_kick(s.handle, C.int32_t(cpu), C.uint64_t(flags)))

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -359,6 +360,18 @@ int ge_consume_shard(struct ge_handle *h, uint32_t shard, struct ev *out)
 	}
 	return ret;
 }
+
+int ge_wait_shard(struct ge_handle *h, uint32_t shard)
+{
+	struct epoll_event event;
+	int ret;
+
+	if (shard >= (h->nr_shards ? h->nr_shards : 1) || !h->events[shard])
+		return -EINVAL;
+	ret = epoll_wait(ring_buffer__epoll_fd(h->events[shard]), &event, 1, 1);
+	return ret < 0 ? -errno : 0;
+}
+
 int ge_submit(struct ge_handle *h, const struct cmd *cmd)
 {
 	if (cmd->cpu < 0 || cmd->cpu >= MAX_CPUS)
